@@ -1,0 +1,6 @@
+{
+  "name": "WhatsApp AI Coordinator Studio",
+  "description": "Interactive WhatsApp AI assistant simulator, knowledge base workbench, multimodal document tester, and n8n escalation studio for University-Tutors.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

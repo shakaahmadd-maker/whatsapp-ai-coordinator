@@ -1,0 +1,80 @@
+{
+  "config": {
+    "agentName": "Sara",
+    "businessName": "University-Tutors",
+    "website": "https://university-tutors.com",
+    "coreServices": "1-on-1 online academic tutoring, subject guidance, coursework & exam preparation, thesis/research mentoring",
+    "subjectsCovered": "Biology, Biotechnology, Chemistry, Mathematics, Computer Science, Business, Engineering, Humanities",
+    "operatingHours": "24/7 AI support; live academic coordinators available 9:00 AM – 11:00 PM PKT / EST",
+    "pricingPolicy": "Rates depend on subject level, urgency, and session duration. Collect the client's subject, academic level, and deadline first before quoting or routing for an exact quote.",
+    "bookingLink": "https://university-tutors.com/book",
+    "paymentMethods": "International card/payment link, bank transfer",
+    "additionalNotes": "",
+    "includeHandoffTag": true
+  },
+  "lastVerification": {
+    "connected": true,
+    "verifiedPhoneNumberId": "1422786037592220",
+    "displayPhoneNumber": "+1 917-809-4906",
+    "verifiedName": "Nano Problem",
+    "qualityRating": "UNKNOWN",
+    "checkedAt": "12:10 PM"
+  },
+  "conversations": {
+    "15550199999": {
+      "phone": "15550199999",
+      "contactName": "Zainab Khan",
+      "lastActiveAt": "2026-11-24T07:50:34.165Z",
+      "aiPaused": false,
+      "handoffReason": null,
+      "leadProfile": {
+        "language": "Urdu / Roman Urdu",
+        "qualificationComplete": true,
+        "academicLevel": "Master's",
+        "goalTimeline": "Coursework guidance, deadline next week",
+        "subject": "Data Science"
+      },
+      "messages": [
+        {
+          "id": "wamid.test.1795503169914",
+          "role": "user",
+          "text": "Hi! I need 1-on-1 tutoring for Undergraduate Biotechnology before my exam next Thursday. How do I book?",
+          "timestamp": "06:52 AM"
+        },
+        {
+          "id": "human-1795503180285",
+          "role": "human_agent",
+          "text": "hello",
+          "timestamp": "06:53 AM",
+          "deliveryStatus": "failed",
+          "deliveryError": "Graph API 400: {\"error\":{\"message\":\"Unsupported post request. Object with ID '+1 (555) 177-4028' does not exist, cannot be loaded due to missing permissions, or does not support this operation. P"
+        },
+        {
+          "id": "ai-1795503678726",
+          "role": "assistant",
+          "text": "Hi! I'd be happy to help you get set up for *Undergraduate Biotechnology* exam prep before next Thursday. You can book your 1-on-1 session directly here: https://university-tutors.com/book — Would you like to share any specific topics or a syllabus so we can match you with the best specialist?",
+          "timestamp": "07:01 AM",
+          "deliveryStatus": "failed",
+          "deliveryError": "Graph API 400: {\"error\":{\"message\":\"Unsupported post request. Object with ID '+1 (555) 177-4028' does not exist, cannot be loaded due to missing permissions, or does not support this operation. P",
+          "handoffTriggered": false
+        },
+        {
+          "id": "wamid.test.1795506618772",
+          "role": "user",
+          "text": "Assalam o alaikum, mujhe Master level Data Science coursework guidance chahiye. Next week deadline hai.",
+          "timestamp": "07:50 AM"
+        },
+        {
+          "id": "ai-1795506634165",
+          "role": "assistant",
+          "text": "Wa alaikum assalam! Bilkul, hum aapko *Master's level Data Science* coursework guidance ke liye 1-on-1 specialist ke sath match kar sakte hain. Aap yahan se apna session book kar sakte hain: https://university-tutors.com/book — Kya aap apna coursework brief ya specific topics share karna chahenge taake hum aapko best tutor ke sath connect kar sakein?",
+          "timestamp": "07:50 AM",
+          "deliveryStatus": "failed",
+          "deliveryError": "WHATSAPP_PHONE_NUMBER_ID must be the numeric Phone Number ID from Meta API Setup (e.g. 1528087943718120), not the formatted phone number like +1 (555) 177-4028.",
+          "handoffTriggered": false
+        }
+      ]
+    }
+  },
+  "tickets": []
+}
