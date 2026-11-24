@@ -1,0 +1,16 @@
+# Nixpacks configuration for Dokploy (if not using Build Type: Dockerfile)
+# Pins Node.js 22 LTS (required by Vite 8 and @google/genai) and runs the
+# Express + Vite full-stack server instead of Nixpacks' static Caddy fallback.
+providers = ["node"]
+
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "NODE_ENV=production ./node_modules/.bin/tsx server.ts"

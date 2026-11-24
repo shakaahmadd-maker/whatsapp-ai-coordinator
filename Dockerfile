@@ -3,9 +3,9 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Install all dependencies (including Vite & TypeScript for build)
-COPY package.json package-lock.json* ./
-RUN npm ci || npm install
+# Install all dependencies deterministically from package-lock.json
+COPY package.json package-lock.json ./
+RUN npm ci
 
 # Copy application source and build the React/Vite frontend bundle
 COPY . .
