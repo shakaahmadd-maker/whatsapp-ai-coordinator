@@ -7,12 +7,17 @@ import { fileURLToPath } from 'url';
 import express, { type Request, type Response } from 'express';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { buildSystemPrompt, DEFAULT_KB_CONFIG } from './src/utils/promptBuilder.ts';
+import {
+  buildSystemPrompt,
+  DEFAULT_KB_CONFIG,
+  findBestMatchingFaq,
+} from './src/utils/promptBuilder.ts';
 import type {
   ChatApiRequest,
   ChatApiResponse,
   EscalationTicket,
   KnowledgeBaseConfig,
+  KnowledgeBaseFaqItem,
   LeadProfile,
   LiveConversation,
   WebhookTrafficEntry,
@@ -89,13 +94,51 @@ interface ServerStore {
   webhookLogs: WebhookTrafficEntry[];
 }
 
+function sanitizeFaqItems(raw: unknown): KnowledgeBaseFaqItem[] {
+  if (!Array.isArray(raw)) return [];
+  const cleaned: KnowledgeBaseFaqItem[] = [];
+  for (const entry of raw.slice(0, 200)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const item = entry as Partial<KnowledgeBaseFaqItem>;
+    const question = typeof item.question === 'string' ? item.question.trim().slice(0, 500) : '';
+    const answer = typeof item.answer === 'string' ? item.answer.trim().slice(0, 2500) : '';
+    if (!question || !answer) continue;
+    const id =
+      typeof item.id === 'string' && item.id.trim()
+        ? item.id.trim().slice(0, 80)
+        : `faq-${Date.now()}-${cleaned.length}`;
+    const category =
+      typeof item.category === 'string' && item.category.trim()
+        ? item.category.trim().slice(0, 40)
+        : 'General';
+    const keywords =
+      typeof item.keywords === 'string' ? item.keywords.trim().slice(0, 300) : '';
+    cleaned.push({
+      id,
+      category,
+      question,
+      keywords: keywords || undefined,
+      answer,
+      enabled: typeof item.enabled === 'boolean' ? item.enabled : true,
+    });
+  }
+  return cleaned;
+}
+
 function loadStore(): ServerStore {
   try {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, 'utf8');
       const parsed = JSON.parse(raw) as Partial<ServerStore>;
+      const mergedConfig: KnowledgeBaseConfig = {
+        ...DEFAULT_KB_CONFIG,
+        ...(parsed.config || {}),
+        faqItems: Array.isArray(parsed.config?.faqItems)
+          ? sanitizeFaqItems(parsed.config.faqItems)
+          : DEFAULT_KB_CONFIG.faqItems,
+      };
       return {
-        config: { ...DEFAULT_KB_CONFIG, ...(parsed.config || {}) },
+        config: mergedConfig,
         phoneNumberIdOverride:
           typeof parsed.phoneNumberIdOverride === 'string'
             ? parsed.phoneNumberIdOverride
@@ -243,6 +286,12 @@ function buildSmartFallbackReply(
   cfg: KnowledgeBaseConfig,
   lead?: LeadProfile
 ): string {
+  // First check if the student's message matches an enabled entry in the Q&A Knowledge Bank
+  const matchedFaq = findBestMatchingFaq(studentText, cfg.faqItems);
+  if (matchedFaq) {
+    return matchedFaq.answer.trim();
+  }
+
   const lower = studentText.toLowerCase();
   const isRomanUrdu =
     /\b(salam|assalam|aoa|mujhe|chahiye|hai|hain|kaise|kya|aap|mera|meri|karna|hoga|hogi|bhai|ji|shukriya|zaroorat)\b/i.test(
@@ -1112,6 +1161,9 @@ app.put('/api/config', (req, res) => {
   if (typeof body.additionalNotes === 'string') sanitized.additionalNotes = body.additionalNotes;
   if (typeof body.includeHandoffTag === 'boolean') {
     sanitized.includeHandoffTag = body.includeHandoffTag;
+  }
+  if (Array.isArray(body.faqItems)) {
+    sanitized.faqItems = sanitizeFaqItems(body.faqItems);
   }
 
   store.config = { ...store.config, ...sanitized };

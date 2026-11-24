@@ -1,3 +1,12 @@
+export interface KnowledgeBaseFaqItem {
+  id: string;
+  category: string;
+  question: string;
+  keywords?: string;
+  answer: string;
+  enabled: boolean;
+}
+
 export interface KnowledgeBaseConfig {
   agentName: string;
   businessName: string;
@@ -10,6 +19,7 @@ export interface KnowledgeBaseConfig {
   paymentMethods: string;
   additionalNotes: string;
   includeHandoffTag: boolean;
+  faqItems?: KnowledgeBaseFaqItem[];
 }
 
 export interface LeadProfile {

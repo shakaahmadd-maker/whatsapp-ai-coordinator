@@ -10,7 +10,41 @@
     "bookingLink": "https://university-tutors.com/book",
     "paymentMethods": "International card/payment link, bank transfer",
     "additionalNotes": "",
-    "includeHandoffTag": true
+    "includeHandoffTag": true,
+    "faqItems": [
+      {
+        "id": "faq-pricing",
+        "category": "Pricing",
+        "question": "How much do you charge for tutoring or coursework guidance?",
+        "keywords": "price, pricing, fee, fees, cost, charges, rate, hourly, kitni fee, charges kya hain",
+        "answer": "Our tutoring rates depend on your *subject*, *academic level* (High School, Undergraduate, Master's, or PhD), and *session duration or deadline*. Share those three details with me and our academic coordinator will provide an exact tailored quote right away.",
+        "enabled": true
+      },
+      {
+        "id": "faq-booking",
+        "category": "Booking",
+        "question": "How do I book a 1-on-1 session or get matched with a tutor?",
+        "keywords": "book, booking, schedule, register, start, trial, how to join, session kaise book karein",
+        "answer": "You can share your *subject*, *level*, and *preferred time/deadline* right here on WhatsApp so I can match you with a specialist, or book directly through our onboarding link: https://university-tutors.com/book",
+        "enabled": true
+      },
+      {
+        "id": "faq-subjects",
+        "category": "Subjects",
+        "question": "Which subjects and academic levels do you cover?",
+        "keywords": "subjects, courses, masters, phd, undergraduate, data science, biology, math, computer science, engineering",
+        "answer": "We support High School, Undergraduate, Master's, and PhD students across *Biology, Biotechnology, Chemistry, Mathematics, Computer Science, Data Science, Business, Engineering, and Humanities*. Let me know your exact topic so I can confirm specialist availability.",
+        "enabled": true
+      },
+      {
+        "id": "faq-urgent",
+        "category": "Deadlines",
+        "question": "Can you help with urgent deadlines or review my syllabus/assignment brief?",
+        "keywords": "urgent, tomorrow, deadline, syllabus, pdf, brief, review, jaldi, file bhejni hai",
+        "answer": "Yes! You can send your *syllabus, rubric, or topic notes* right here as a PDF, Word doc, or clear photo along with your target date, and we will prioritize matching you with an available 1-on-1 tutor for focused guidance and exam/coursework preparation.",
+        "enabled": true
+      }
+    ]
   },
   "lastVerification": {
     "connected": true,
@@ -76,5 +110,6 @@
       ]
     }
   },
-  "tickets": []
+  "tickets": [],
+  "webhookLogs": []
 }
