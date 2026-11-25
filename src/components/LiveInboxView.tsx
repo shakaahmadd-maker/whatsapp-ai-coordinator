@@ -14,6 +14,7 @@ import { WhatsAppText } from './WhatsAppText';
 
 interface LiveInboxViewProps {
   conversations: LiveConversation[];
+  focusedPhone?: string | null;
   onSendManualReply: (phone: string, text: string) => Promise<void>;
   onToggleAiPause: (phone: string, aiPaused: boolean) => Promise<void>;
   onTriggerTestIncoming: (phone: string, contactName: string, text: string) => Promise<void>;
@@ -25,13 +26,14 @@ const BUSINESS_SELF_PHONE = '19178094906';
 
 export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
   conversations,
+  focusedPhone,
   onSendManualReply,
   onToggleAiPause,
   onTriggerTestIncoming,
   onNavigateSetup,
 }) => {
   const [selectedPhone, setSelectedPhone] = useState<string | null>(
-    conversations[0]?.phone ?? null
+    focusedPhone ?? conversations[0]?.phone ?? null
   );
   const [replyDraft, setReplyDraft] = useState('');
   const [sendingReply, setSendingReply] = useState(false);
@@ -46,6 +48,12 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
 
   const activeConv =
     conversations.find((c) => c.phone === selectedPhone) ?? conversations[0] ?? null;
+
+  useEffect(() => {
+    if (focusedPhone) {
+      setSelectedPhone(focusedPhone);
+    }
+  }, [focusedPhone]);
 
   useEffect(() => {
     if (!selectedPhone && conversations.length > 0) {

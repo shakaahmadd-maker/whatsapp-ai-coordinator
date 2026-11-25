@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Bell, BellOff, MessageSquare, X } from 'lucide-react';
 import { LiveInboxView } from './components/LiveInboxView';
 import { SimulatorView } from './components/SimulatorView';
 import { KnowledgeBaseView } from './components/KnowledgeBaseView';
@@ -6,6 +7,10 @@ import { EscalationsView } from './components/EscalationsView';
 import { WhatsAppSetupView } from './components/WhatsAppSetupView';
 import { DEFAULT_KB_CONFIG } from './utils/promptBuilder';
 import { evaluateWhatsAppCompliance, formatTimeNow } from './utils/whatsappFormatter';
+import {
+  playIncomingNotificationSound,
+  unlockNotificationAudio,
+} from './utils/notificationSound';
 import type {
   ChatApiResponse,
   ChatAttachment,
@@ -19,7 +24,16 @@ import type {
 
 type WorkspaceTab = 'inbox' | 'simulator' | 'knowledge' | 'escalations' | 'setup';
 
+interface IncomingPopupAlert {
+  id: string;
+  phone: string;
+  contactName: string;
+  text: string;
+  timestamp: string;
+}
+
 const STORAGE_KB_KEY = 'wa_coordinator_kb_v1';
+const STORAGE_SOUND_KEY = 'wa_studio_sound_v1';
 
 function createInitialGreeting(config: KnowledgeBaseConfig): ChatMessage {
   const greeting = `Hey! I'm ${config.agentName} from ${config.businessName}. What are you working on today?`;
@@ -67,6 +81,105 @@ export default function App() {
   const [isSending, setIsSending] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const [focusedPhone, setFocusedPhone] = useState<string | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_SOUND_KEY);
+      if (saved !== null) return saved === 'true';
+    } catch {
+      // Default to enabled
+    }
+    return true;
+  });
+  const [incomingAlerts, setIncomingAlerts] = useState<IncomingPopupAlert[]>([]);
+
+  const soundEnabledRef = useRef(soundEnabled);
+  const seenUserMessageIdsRef = useRef<Set<string>>(new Set());
+  const initialConversationsHydratedRef = useRef(false);
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
+
+  // Unlock Web Audio on first user interaction so incoming text chimes play reliably
+  useEffect(() => {
+    const handleFirstInteraction = () => {
+      unlockNotificationAudio();
+    };
+    window.addEventListener('pointerdown', handleFirstInteraction, { once: true });
+    window.addEventListener('keydown', handleFirstInteraction, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', handleFirstInteraction);
+      window.removeEventListener('keydown', handleFirstInteraction);
+    };
+  }, []);
+
+  const dismissIncomingAlert = useCallback((id: string) => {
+    setIncomingAlerts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const handleToggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    try {
+      localStorage.setItem(STORAGE_SOUND_KEY, String(next));
+    } catch {
+      // Ignore storage error
+    }
+    if (next) {
+      unlockNotificationAudio();
+      playIncomingNotificationSound();
+    }
+  };
+
+  const handleOpenAlertThread = (alert: IncomingPopupAlert) => {
+    setFocusedPhone(alert.phone);
+    setActiveTab('inbox');
+    dismissIncomingAlert(alert.id);
+  };
+
+  const processIncomingSnapshotAlerts = useCallback(
+    (conversations: LiveConversation[], isInitialLoad: boolean) => {
+      const newlyArrived: IncomingPopupAlert[] = [];
+
+      for (const conv of conversations) {
+        for (const msg of conv.messages || []) {
+          if (msg.role !== 'user') continue;
+          if (!seenUserMessageIdsRef.current.has(msg.id)) {
+            seenUserMessageIdsRef.current.add(msg.id);
+            if (!isInitialLoad && initialConversationsHydratedRef.current) {
+              newlyArrived.push({
+                id: msg.id,
+                phone: conv.phone,
+                contactName: conv.contactName || conv.phone,
+                text: msg.text || (msg.attachmentName ? `Sent file: ${msg.attachmentName}` : 'New message'),
+                timestamp: msg.timestamp || formatTimeNow(),
+              });
+            }
+          }
+        }
+      }
+
+      if (isInitialLoad || !initialConversationsHydratedRef.current) {
+        initialConversationsHydratedRef.current = true;
+        return;
+      }
+
+      if (newlyArrived.length > 0) {
+        if (soundEnabledRef.current) {
+          playIncomingNotificationSound();
+        }
+        setIncomingAlerts((prev) => [...newlyArrived, ...prev].slice(0, 3));
+        for (const item of newlyArrived) {
+          window.setTimeout(() => {
+            setIncomingAlerts((prev) => prev.filter((a) => a.id !== item.id));
+          }, 7000);
+        }
+      }
+    },
+    []
+  );
+
   const refreshStatus = useCallback(async () => {
     try {
       const res = await fetch('/api/whatsapp/status');
@@ -99,7 +212,9 @@ export default function App() {
             conversations: LiveConversation[];
             tickets: EscalationTicket[];
           };
-          setLiveConversations(data.conversations || []);
+          const convs = data.conversations || [];
+          processIncomingSnapshotAlerts(convs, true);
+          setLiveConversations(convs);
           setServerTickets(data.tickets || []);
         }
       } catch {
@@ -115,7 +230,9 @@ export default function App() {
           conversations: LiveConversation[];
           tickets: EscalationTicket[];
         };
-        setLiveConversations(parsed.conversations || []);
+        const convs = parsed.conversations || [];
+        processIncomingSnapshotAlerts(convs, false);
+        setLiveConversations(convs);
         setServerTickets(parsed.tickets || []);
       } catch {
         // Ignore malformed event
@@ -125,7 +242,7 @@ export default function App() {
     return () => {
       eventSource.close();
     };
-  }, [refreshStatus]);
+  }, [refreshStatus, processIncomingSnapshotAlerts]);
 
   const handleResetChat = () => {
     setMessages([createInitialGreeting(config)]);
@@ -403,7 +520,25 @@ export default function App() {
             </button>
           </nav>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={handleToggleSound}
+              title={soundEnabled ? 'Mute incoming message sound' : 'Unmute incoming message sound'}
+              aria-label={soundEnabled ? 'Mute incoming message sound' : 'Unmute incoming message sound'}
+              className={`px-2.5 py-2 text-xs font-medium rounded-lg border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                soundEnabled
+                  ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                  : 'bg-slate-100 text-slate-400 border-slate-200 hover:text-slate-600'
+              }`}
+            >
+              {soundEnabled ? (
+                <Bell className="w-3.5 h-3.5 text-[#075E54]" />
+              ) : (
+                <BellOff className="w-3.5 h-3.5" />
+              )}
+              <span className="hidden sm:inline">{soundEnabled ? 'Sound On' : 'Muted'}</span>
+            </button>
             <button
               type="button"
               onClick={handleResetChat}
@@ -464,6 +599,7 @@ export default function App() {
         {activeTab === 'inbox' && (
           <LiveInboxView
             conversations={liveConversations}
+            focusedPhone={focusedPhone}
             onSendManualReply={handleSendManualReply}
             onToggleAiPause={handleToggleAiPause}
             onTriggerTestIncoming={handleTriggerTestIncoming}
@@ -513,6 +649,60 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Real-time incoming WhatsApp text pop-up alerts */}
+      {incomingAlerts.length > 0 && (
+        <div
+          aria-live="polite"
+          className="fixed bottom-5 right-5 z-50 flex flex-col gap-2.5 w-[340px] max-w-[calc(100vw-2rem)]"
+        >
+          {incomingAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="bg-white border border-slate-200 border-l-4 border-l-[#075E54] rounded-xl shadow-lg p-3.5 transition-all"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleOpenAlertThread(alert)}
+                  className="flex items-start gap-2.5 text-left min-w-0 flex-1 group"
+                >
+                  <div className="w-8 h-8 rounded-lg bg-emerald-50 text-[#075E54] flex items-center justify-center shrink-0 mt-0.5">
+                    <MessageSquare className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-slate-900 truncate group-hover:text-[#075E54]">
+                        {alert.contactName}
+                      </p>
+                      <span className="text-[11px] text-slate-400 shrink-0 tabular-nums">
+                        {alert.timestamp}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 font-mono truncate">
+                      +{alert.phone.replace(/^\+/, '')}
+                    </p>
+                    <p className="text-xs text-slate-700 mt-1 line-clamp-2 leading-snug">
+                      {alert.text}
+                    </p>
+                    <span className="inline-block text-[11px] font-medium text-[#075E54] mt-1.5 group-hover:underline">
+                      Open conversation
+                    </span>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => dismissIncomingAlert(alert.id)}
+                  aria-label="Dismiss notification"
+                  className="p-1 text-slate-400 hover:text-slate-600 rounded-md hover:bg-slate-100 shrink-0"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
