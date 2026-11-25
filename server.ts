@@ -215,14 +215,48 @@ function rememberMessageId(id: string): boolean {
   return true;
 }
 
-const ai = new GoogleGenAI({
-  apiKey: cleanEnvValue(process.env.GEMINI_API_KEY),
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+class GeminiApiError extends Error {
+  code: 'MISSING_KEY' | 'INVALID_KEY' | 'QUOTA_EXHAUSTED' | 'TRANSIENT';
+  status: number;
+
+  constructor(
+    code: 'MISSING_KEY' | 'INVALID_KEY' | 'QUOTA_EXHAUSTED' | 'TRANSIENT',
+    status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'GeminiApiError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+let cachedGeminiClient: { apiKey: string; client: GoogleGenAI } | null = null;
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = cleanEnvValue(process.env.GEMINI_API_KEY);
+  if (!apiKey) {
+    throw new GeminiApiError(
+      'MISSING_KEY',
+      500,
+      'GEMINI_API_KEY is not configured in runtime environment variables.'
+    );
+  }
+  if (!cachedGeminiClient || cachedGeminiClient.apiKey !== apiKey) {
+    cachedGeminiClient = {
+      apiKey,
+      client: new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      }),
+    };
+  }
+  return cachedGeminiClient.client;
+}
 
 function formatTimestamp(): string {
   return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -250,22 +284,34 @@ function recordWebhookEvent(
   persistStore();
 }
 
-const dailyQuotaCooldownUntil = new Map<string, number>();
-
-function isDailyQuotaExhausted(errStr: string): boolean {
+function isInvalidGeminiApiKeyError(errStr: string): boolean {
   const lower = errStr.toLowerCase();
   return (
-    (lower.includes('429') || lower.includes('resource_exhausted')) &&
-    (lower.includes('per day') ||
-      lower.includes('free_tier_requests') ||
-      lower.includes('generate_content_free_tier_requests'))
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('invalid api key') ||
+    (lower.includes('400') && lower.includes('key'))
+  );
+}
+
+function isQuotaExceededError(errStr: string): boolean {
+  const lower = errStr.toLowerCase();
+  return (
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('quota') ||
+    lower.includes('free_tier_requests') ||
+    lower.includes('rate limit')
   );
 }
 
 function summarizeGeminiError(errStr: string): string {
   if (errStr.startsWith('TIMEOUT:')) return errStr;
-  if (isDailyQuotaExhausted(errStr)) {
-    return '429 Free Tier daily limit (20 req/day) reached — upgrade billing on GEMINI_API_KEY in Google AI Studio';
+  if (isInvalidGeminiApiKeyError(errStr)) {
+    return 'HTTP 400 INVALID_ARGUMENT: GEMINI_API_KEY is invalid or restricted. Verify the key in Dokploy runtime environment variables.';
+  }
+  if (isQuotaExceededError(errStr)) {
+    return 'HTTP 429 RESOURCE_EXHAUSTED: Gemini API quota exceeded. Check billing and quota limits for your GEMINI_API_KEY project.';
   }
   try {
     const parsedErr = JSON.parse(errStr) as {
@@ -437,11 +483,7 @@ async function generateAgentReply(
   messages: ChatApiRequest['messages'],
   currentLead: LeadProfile
 ): Promise<ChatApiResponse> {
-  if (!cleanEnvValue(process.env.GEMINI_API_KEY)) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured. Please verify your key in Settings > Secrets.'
-    );
-  }
+  const ai = getGeminiClient();
 
   const systemInstruction = `${buildSystemPrompt(config)}
 
@@ -533,146 +575,92 @@ You must output valid JSON matching the requested schema:
     required: ['reply', 'handoffRequired', 'leadProfile'],
   };
 
-  // Highest Flash model first (Gemini 4 Hydrogen / Flash) with ThinkingLevel.LOW for fast replies,
-  // 10s per-attempt timeout, 10m cooldown on daily 20/day Free Tier caps,
-  // and 2-pass recovery across non-exhausted tiers when brief 503 demand spikes occur.
+  // Primary Flash model with compact transient-only fallback (503 / 500 / 404 / timeout).
+  // HTTP 400 (invalid key) and HTTP 429 (quota exceeded) fail fast without looping across models.
   const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
-  const DAILY_COOLDOWN_MS = 10 * 60 * 1000;
-  const fullModelChain = [
+  const modelChain = [
     { model: 'gemini-4-hydrogen', useLowThinking: true },
     { model: 'gemini-3.8-flash', useLowThinking: true },
-    { model: 'gemini-3.6-flash', useLowThinking: true },
     { model: 'gemini-3.5-flash-lite', useLowThinking: false },
-    { model: 'gemini-3.1-flash-lite', useLowThinking: false },
-    { model: 'gemini-4-neon', useLowThinking: true },
   ] as const;
 
-  const now = Date.now();
-  const activeChain = fullModelChain.filter(
-    (c) => (dailyQuotaCooldownUntil.get(c.model) || 0) <= now
-  );
-  // If every model is on cooldown, still attempt the full chain once in case quota reset or billing was upgraded
-  const baseChain = activeChain.length > 0 ? activeChain : [...fullModelChain];
   const tierErrors: string[] = [];
 
-  // Run up to 2 passes if Pass 1 hit transient 503 spikes on still-available models
-  for (let pass = 1; pass <= 2; pass++) {
-    const passChain =
-      pass === 1
-        ? baseChain
-        : baseChain.filter((c) => (dailyQuotaCooldownUntil.get(c.model) || 0) <= Date.now());
+  for (let idx = 0; idx < modelChain.length; idx++) {
+    const candidate = modelChain[idx];
+    const candidateModel = candidate.model;
 
-    if (pass === 2) {
-      if (passChain.length === 0) break;
-      console.warn(
-        `[Gemini Pass 2 recovery in 2000ms across ${passChain.map((c) => c.model).join(', ')}]`
+    try {
+      response = await withTimeout(
+        ai.models.generateContent({
+          model: candidateModel,
+          contents,
+          config: {
+            systemInstruction,
+            ...(candidate.useLowThinking
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: 'application/json',
+            responseSchema,
+          },
+        }),
+        GEMINI_ATTEMPT_TIMEOUT_MS,
+        candidateModel
       );
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
+      modelUsed = candidateModel;
+      if (idx > 0) {
+        console.log(`[Gemini succeeded using fallback model ${candidateModel}]`);
+      }
+      break;
+    } catch (err) {
+      lastError = err;
+      const errStr = err instanceof Error ? err.message : String(err);
+      const shortReason = summarizeGeminiError(errStr);
 
-    let sawTransient503 = false;
-
-    for (let idx = 0; idx < passChain.length; idx++) {
-      const candidate = passChain[idx];
-      const candidateModel = candidate.model;
-      let retriedCurrentTier = false;
-
-      while (true) {
-        try {
-          response = await withTimeout(
-            ai.models.generateContent({
-              model: candidateModel,
-              contents,
-              config: {
-                systemInstruction,
-                ...(candidate.useLowThinking
-                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                  : {}),
-                responseMimeType: 'application/json',
-                responseSchema,
-              },
-            }),
-            GEMINI_ATTEMPT_TIMEOUT_MS,
-            candidateModel
-          );
-          dailyQuotaCooldownUntil.delete(candidateModel);
-          modelUsed = candidateModel;
-          if (idx > 0 || retriedCurrentTier || pass > 1) {
-            console.log(
-              `[Gemini succeeded using ${candidateModel} (pass ${pass}${retriedCurrentTier ? ', retried' : ''})]`
-            );
-          }
-          break;
-        } catch (err) {
-          lastError = err;
-          const errStr = err instanceof Error ? err.message : String(err);
-          const shortReason = summarizeGeminiError(errStr);
-
-          const isTimeout = errStr.startsWith('TIMEOUT:');
-          const isDailyLimit = isDailyQuotaExhausted(errStr);
-          const isThrottleOrOverload =
-            errStr.includes('503') ||
-            errStr.includes('429') ||
-            errStr.includes('UNAVAILABLE') ||
-            errStr.includes('RESOURCE_EXHAUSTED') ||
-            errStr.includes('overloaded');
-          const isNotFound = errStr.includes('404') || errStr.includes('NOT_FOUND');
-          const isServerTransient = errStr.includes('500');
-
-          if (isDailyLimit) {
-            dailyQuotaCooldownUntil.set(candidateModel, Date.now() + DAILY_COOLDOWN_MS);
-          } else if (isThrottleOrOverload || isTimeout) {
-            sawTransient503 = true;
-          }
-
-          // Retry once after 1.5s ONLY on pass 1 for transient 503 / per-minute 429
-          if (
-            pass === 1 &&
-            isThrottleOrOverload &&
-            !isDailyLimit &&
-            !isTimeout &&
-            !retriedCurrentTier
-          ) {
-            retriedCurrentTier = true;
-            console.warn(
-              `[Gemini ${candidateModel} returned transient 503/429, retrying once in 1500ms]`,
-              shortReason
-            );
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-            continue;
-          }
-
-          if (pass === 1) {
-            tierErrors.push(`${candidateModel} (${shortReason})`);
-          }
-          const shouldAdvance =
-            isTimeout || isThrottleOrOverload || isNotFound || isServerTransient;
-
-          if (!shouldAdvance) {
-            throw new Error(`All Gemini tiers failed — ${tierErrors.join(' -> ')}`);
-          }
-
-          if (idx < passChain.length - 1) {
-            const nextModel = passChain[idx + 1].model;
-            console.warn(
-              `[Gemini ${candidateModel} unavailable (pass ${pass}), advancing to ${nextModel}]`,
-              shortReason
-            );
-          }
-          break;
-        }
+      // Fail fast on HTTP 400 invalid API key — never retry other models
+      if (isInvalidGeminiApiKeyError(errStr)) {
+        throw new GeminiApiError('INVALID_KEY', 400, shortReason);
       }
 
-      if (response) break;
-    }
+      // Fail fast on HTTP 429 quota exceeded — do not spam retries across models
+      if (isQuotaExceededError(errStr)) {
+        throw new GeminiApiError('QUOTA_EXHAUSTED', 429, shortReason);
+      }
 
-    if (response || !sawTransient503) break;
+      tierErrors.push(`${candidateModel} (${shortReason})`);
+
+      const isTransient =
+        errStr.startsWith('TIMEOUT:') ||
+        errStr.includes('503') ||
+        errStr.includes('UNAVAILABLE') ||
+        errStr.includes('overloaded') ||
+        errStr.includes('404') ||
+        errStr.includes('NOT_FOUND') ||
+        errStr.includes('500');
+
+      if (!isTransient) {
+        throw new GeminiApiError(
+          'TRANSIENT',
+          502,
+          `Gemini request failed on ${candidateModel}: ${shortReason}`
+        );
+      }
+
+      if (idx < modelChain.length - 1) {
+        console.warn(
+          `[Gemini ${candidateModel} transiently unavailable, trying ${modelChain[idx + 1].model}]`,
+          shortReason
+        );
+      }
+    }
   }
 
   if (!response) {
-    throw new Error(
+    throw new GeminiApiError(
+      'TRANSIENT',
+      503,
       tierErrors.length > 0
-        ? `All Gemini tiers failed — ${tierErrors.join(' -> ')}`
+        ? `Gemini temporarily unavailable — ${tierErrors.join(' -> ')}`
         : lastError instanceof Error
         ? lastError.message
         : 'Gemini API call failed.'
@@ -681,7 +669,7 @@ You must output valid JSON matching the requested schema:
 
   const rawText = response.text?.trim();
   if (!rawText) {
-    throw new Error('Model returned an empty response.');
+    throw new GeminiApiError('TRANSIENT', 502, 'Model returned an empty response.');
   }
   const parsed = JSON.parse(rawText) as ChatApiResponse;
   return { ...parsed, modelUsed };
@@ -1120,19 +1108,39 @@ app.get('/api/health', (_req, res) => {
 
 // Simulator chat endpoint
 app.post('/api/chat', async (req, res) => {
-  try {
-    const body = req.body as ChatApiRequest;
-    if (!body || !body.config || !Array.isArray(body.messages) || body.messages.length === 0) {
-      res.status(400).json({ error: 'Invalid chat request payload.' });
-      return;
-    }
+  const body = req.body as ChatApiRequest;
+  if (!body || !body.config || !Array.isArray(body.messages) || body.messages.length === 0) {
+    res.status(400).json({ error: 'Invalid chat request payload.' });
+    return;
+  }
 
+  try {
     const parsed = await generateAgentReply(body.config, body.messages, body.currentLead);
     res.json(parsed);
   } catch (err: unknown) {
+    const lastUserText =
+      [...body.messages].reverse().find((m) => m.role === 'user')?.text || '';
+
+    if (err instanceof GeminiApiError) {
+      console.error(`[/api/chat ${err.code} (${err.status})]`, err.message);
+      if (err.code === 'QUOTA_EXHAUSTED') {
+        res.status(429).json({
+          error: err.message,
+          code: err.code,
+          fallbackReply: buildSmartFallbackReply(lastUserText, body.config, body.currentLead),
+        });
+        return;
+      }
+      res.status(err.status).json({
+        error: err.message,
+        code: err.code,
+      });
+      return;
+    }
+
     const message =
       err instanceof Error ? err.message : 'Unexpected server error calling Gemini API.';
-    console.error('[/api/chat error]', err);
+    console.error('[/api/chat error]', message);
     res.status(500).json({ error: message });
   }
 });
@@ -1477,18 +1485,19 @@ app.post('/api/whatsapp/test-incoming', async (req, res) => {
   res.json({ ok: true, conversation: store.conversations[targetPhone] });
 });
 
-// Meta WhatsApp Cloud API Webhook Verification
-app.get('/api/whatsapp/webhook', (req, res) => {
+// Meta WhatsApp Cloud API Webhook Verification (plain text challenge or HTTP 403)
+const handleWhatsAppWebhookGet = (req: Request, res: Response) => {
   const mode = req.query['hub.mode'];
-  const token = typeof req.query['hub.verify_token'] === 'string'
-    ? req.query['hub.verify_token'].trim()
-    : '';
-  const challenge = req.query['hub.challenge'];
+  const token =
+    typeof req.query['hub.verify_token'] === 'string'
+      ? req.query['hub.verify_token'].trim()
+      : '';
+  const challenge = typeof req.query['hub.challenge'] === 'string' ? req.query['hub.challenge'] : '';
   const expectedToken = cleanEnvValue(process.env.WHATSAPP_VERIFY_TOKEN);
 
   if (mode === 'subscribe' && expectedToken && token === expectedToken) {
     recordWebhookEvent('GET', 200, 'verify_ok', 'Meta webhook challenge verified successfully.');
-    res.status(200).send(typeof challenge === 'string' ? challenge : '');
+    res.status(200).type('text/plain').send(challenge);
     return;
   }
   console.warn('[WhatsApp Webhook] GET verification failed (mode or verify_token mismatch).');
@@ -1499,10 +1508,10 @@ app.get('/api/whatsapp/webhook', (req, res) => {
     'Verify token mismatch or invalid hub.mode — check WHATSAPP_VERIFY_TOKEN matches Meta.'
   );
   res.sendStatus(403);
-});
+};
 
 // Meta WhatsApp Cloud API Incoming Messages Webhook
-app.post('/api/whatsapp/webhook', async (req, res) => {
+const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
   const sigCheck = verifyMetaSignature(req);
   if (!sigCheck.ok) {
     recordWebhookEvent(
@@ -1586,9 +1595,15 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
   );
 
   const accessToken = cleanEnvValue(process.env.WHATSAPP_ACCESS_TOKEN);
+  const isServerlessCloudRun = Boolean(process.env.K_SERVICE);
 
-  // Process BEFORE ending the HTTP response (up to 14s cap, under Meta's 20s timeout)
-  // so Cloud Run keeps full CPU allocated during Gemini generation & Graph API reply dispatch.
+  // On always-on Docker / Dokploy containers, acknowledge Meta immediately with HTTP 200
+  // and process messages asynchronously right after. On Cloud Run (K_SERVICE set), wait briefly
+  // before ending the HTTP response so CPU stays allocated during processing.
+  if (!isServerlessCloudRun) {
+    res.sendStatus(200);
+  }
+
   const processAll = (async () => {
     for (const entry of payload.entry || []) {
       for (const change of entry.changes || []) {
@@ -1665,17 +1680,49 @@ app.post('/api/whatsapp/webhook', async (req, res) => {
     console.error('[WhatsApp Webhook processing error]', err);
   });
 
-  await Promise.race([
-    processAll,
-    new Promise<void>((resolve) => setTimeout(resolve, 16000)),
-  ]);
+  if (isServerlessCloudRun) {
+    await Promise.race([
+      processAll,
+      new Promise<void>((resolve) => setTimeout(resolve, 16000)),
+    ]);
 
-  if (!res.headersSent) {
-    res.sendStatus(200);
+    if (!res.headersSent) {
+      res.sendStatus(200);
+    }
   }
-});
+};
+
+// Register both /api/webhook and /api/whatsapp/webhook BEFORE the SPA fallback
+app.get('/api/webhook', handleWhatsAppWebhookGet);
+app.post('/api/webhook', handleWhatsAppWebhookPost);
+app.get('/api/whatsapp/webhook', handleWhatsAppWebhookGet);
+app.post('/api/whatsapp/webhook', handleWhatsAppWebhookPost);
+
+function logRuntimeEnvStatus() {
+  const vars = [
+    'GEMINI_API_KEY',
+    'WHATSAPP_ACCESS_TOKEN',
+    'WHATSAPP_PHONE_NUMBER_ID',
+    'WHATSAPP_VERIFY_TOKEN',
+    'WHATSAPP_APP_SECRET',
+    'APP_URL',
+    'PORT',
+    'DATA_DIR',
+    'NODE_ENV',
+  ] as const;
+
+  const summary = vars
+    .map((key) => `${key}=${cleanEnvValue(process.env[key]) ? 'set' : 'missing'}`)
+    .join(', ');
+  console.log(`[Runtime Env Presence] ${summary}`);
+}
 
 async function startServer() {
+  // Prevent any unmatched /api/* route from falling through to the React SPA HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API route not found.' });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1691,7 +1738,10 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on http://localhost:${PORT} (DATA_DIR=${DATA_DIR})`);
+    console.log(
+      `Server listening on http://0.0.0.0:${PORT} (NODE_ENV=${process.env.NODE_ENV || 'development'}, DATA_DIR=${DATA_DIR})`
+    );
+    logRuntimeEnvStatus();
   });
 }
 
