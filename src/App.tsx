@@ -22,7 +22,7 @@ type WorkspaceTab = 'inbox' | 'simulator' | 'knowledge' | 'escalations' | 'setup
 const STORAGE_KB_KEY = 'wa_coordinator_kb_v1';
 
 function createInitialGreeting(config: KnowledgeBaseConfig): ChatMessage {
-  const greeting = `Hi there! I'm *${config.agentName}* from *${config.businessName}*.\n\nI can help with 1-on-1 tutoring, exam prep, or matching you with a specialist. What subject or topic are you looking for help with today?`;
+  const greeting = `Hi! This is ${config.agentName} from ${config.businessName}. What academic help do you need today, and what is your subject or deadline?`;
   return {
     id: 'msg-welcome',
     role: 'assistant',

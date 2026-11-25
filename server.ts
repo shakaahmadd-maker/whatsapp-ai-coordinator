@@ -335,59 +335,35 @@ function buildSmartFallbackReply(
   // First check if the student's message matches an enabled entry in the Q&A Knowledge Bank
   const matchedFaq = findBestMatchingFaq(studentText, cfg.faqItems);
   if (matchedFaq) {
-    return matchedFaq.answer.trim();
+    return matchedFaq.answer.replace(/\*/g, '').trim();
   }
 
   const lower = studentText.toLowerCase();
   const isRomanUrdu =
-    /\b(salam|assalam|aoa|mujhe|chahiye|hai|hain|kaise|kya|aap|mera|meri|karna|hoga|hogi|bhai|ji|shukriya|zaroorat)\b/i.test(
+    /\b(salam|assalam|aoa|mujhe|chahiye|hai|hain|kaise|kya|aap|mera|meri|karna|hoga|hogi|bhai|ji|shukriya|zaroorat|fees|kitni)\b/i.test(
       lower
     ) || lead?.language?.toLowerCase().includes('urdu');
 
-  const bookingPartUr = cfg.bookingLink
-    ? `\n\nAap direct session book karne ke liye yahan visit kar sakte hain: ${cfg.bookingLink}`
-    : '';
-  const bookingPartEn = cfg.bookingLink
-    ? `\n\nYou can also book your 1-on-1 session directly here: ${cfg.bookingLink}`
-    : '';
+  const isPricingOrUrgent =
+    /\b(price|pricing|cost|fee|fees|charge|charges|rate|urgent|rush|asap|human|specialist|manager|call|team|kitni|paise)\b/i.test(
+      lower
+    );
 
-  const hasSubject = Boolean(lead?.subject);
-  const hasLevel = Boolean(lead?.academicLevel);
-  const hasGoal = Boolean(lead?.goalTimeline);
-
-  // If the student already shared some details, acknowledge them and only ask for what's still missing
-  if (hasSubject || hasLevel) {
-    const knownSummary = [lead?.academicLevel, lead?.subject].filter(Boolean).join(' ');
-    const missingEn: string[] = [];
-    const missingUr: string[] = [];
-    if (!hasSubject) {
-      missingEn.push('subject');
-      missingUr.push('subject');
-    }
-    if (!hasLevel) {
-      missingEn.push('academic level');
-      missingUr.push('academic level');
-    }
-    if (!hasGoal) {
-      missingEn.push('target deadline');
-      missingUr.push('deadline');
-    }
-
-    if (missingEn.length === 0) {
-      return isRomanUrdu
-        ? `Shukriya! Humne aapki *${knownSummary}* details note kar li hain. Hamare academic coordinator jaldi aap se rabta kar ke best tutor match kar denge.${bookingPartUr}`
-        : `Thanks for confirming! We have your *${knownSummary}* details noted, and an academic coordinator will match you with the right specialist shortly.${bookingPartEn}`;
-    }
-
+  if (isPricingOrUrgent) {
     return isRomanUrdu
-      ? `Shukriya! Humne *${knownSummary}* note kar liya hai. Bas apni *${missingUr.join(' aur ')}* bhi share kar dein taake hum aapko foran best tutor se connect kar sakein.${bookingPartUr}`
-      : `Got it — thanks for confirming for *${knownSummary}*! Could you also share your *${missingEn.join(' and ')}* so our coordinator can match you with the right tutor right away?${bookingPartEn}`;
+      ? 'Ek minute wait karein, main apni team se check kar ke abhi batati hoon.'
+      : 'Wait a moment, let me check with my team and get right back to you.';
   }
 
-  if (isRomanUrdu) {
-    return `Wa alaikum assalam! *${cfg.businessName}* se rabta karne ka shukriya. Please apna *subject*, *academic level* (High School / Undergraduate / Master's / PhD), aur *deadline* share kar dein taake hamare academic coordinator aapko foran best tutor ke sath connect kar sakein.${bookingPartUr}`;
+  if (lead?.subject || lead?.academicLevel) {
+    return isRomanUrdu
+      ? 'Ek minute wait karein, main apni team se check kar ke abhi batati hoon.'
+      : 'Wait a moment, let me check with my team and get right back to you.';
   }
-  return `Hi! Thanks for messaging *${cfg.businessName}*. Please share your *subject*, *academic level*, and *deadline* so our academic coordinator can match you with the right tutor right away.${bookingPartEn}`;
+
+  return isRomanUrdu
+    ? 'Ji bilkul, aaj kis subject ya deadline mein help chahiye?'
+    : 'Sure, what academic problem do you need help with today, and what is your subject or deadline?';
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -485,27 +461,18 @@ async function generateAgentReply(
 ): Promise<ChatApiResponse> {
   const ai = getGeminiClient();
 
+  // Keep context window strictly to the last 6 messages to minimize token usage
+  const recentMessages = messages.slice(-6);
+
   const systemInstruction = `${buildSystemPrompt(config)}
 
-# RESPONSE FORMAT INSTRUCTION
-You must output valid JSON matching the requested schema:
-- "reply": Your WhatsApp reply string adhering strictly to every formatting, tone, language mirroring, anti-hallucination, and escalation rule above. ${
-    config.includeHandoffTag
-      ? 'When escalating (handoffRequired is true), append `[HANDOFF_REQUIRED]` at the end of the reply.'
-      : 'Do not append `[HANDOFF_REQUIRED]` inside the reply text.'
-  }
-- "handoffRequired": boolean (true if ANY Human Handoff & Escalation condition is triggered, otherwise false).
-- "handoffReason": short plain-text reason when handoffRequired is true (e.g. "Billing dispute / refund request", "Requested live human agent", "Unverified discount inquiry"), or null when false.
-- "leadProfile": updated lead extraction merging previously known details (${JSON.stringify(
-    currentLead
-  )}) with any new facts discovered in this turn:
-  - "subject": string or null
-  - "academicLevel": string or null (High School, Undergraduate, Master's, PhD, or specific program)
-  - "goalTimeline": string or null (e.g., ongoing tutoring, exam prep, or specific deadline)
-  - "language": string (e.g., "English", "Urdu / Roman Urdu", "Arabic", "Spanish")
-  - "qualificationComplete": boolean (true only when subject, academicLevel, and goalTimeline are all clearly known)`;
+JSON OUTPUT (keep all fields ultra-short; reply <= 20 words, plain text):
+- reply: string (1-2 brief lines, max 20 words, plain text only)
+- handoffRequired: boolean
+- handoffReason: short string or null
+- leadProfile: merge ${JSON.stringify(currentLead)} -> {subject, academicLevel, goalTimeline, language, qualificationComplete}`;
 
-  const contents = messages.map((msg) => {
+  const contents = recentMessages.map((msg) => {
     const parts: Array<Record<string, unknown>> = [];
     if (msg.attachment?.base64Data && msg.attachment?.mimeType) {
       const mime = msg.attachment.mimeType.toLowerCase();
@@ -523,16 +490,16 @@ You must output valid JSON matching the requested schema:
         const extracted = extractDocxText(msg.attachment.base64Data);
         if (extracted) {
           parts.push({
-            text: `[Attached DOCX document "${msg.attachment.name}" — extracted text]:\n${extracted}`,
+            text: `[Attached DOCX "${msg.attachment.name}"]:\n${extracted.slice(0, 2000)}`,
           });
         } else {
           parts.push({
-            text: `[Client sent DOCX document "${msg.attachment.name}", but text could not be extracted cleanly. Confirm receipt warmly and ask them to resend as a PDF/clear photo or paste the key details.]`,
+            text: `[Client sent DOCX "${msg.attachment.name}" (unreadable). Ask for PDF/photo or pasted text.]`,
           });
         }
       } else {
         parts.push({
-          text: `[Client sent file "${msg.attachment.name}" (${msg.attachment.mimeType}), which cannot be previewed directly. Confirm receipt warmly and ask for a PDF/clear photo or key details.]`,
+          text: `[Client sent file "${msg.attachment.name}" (${msg.attachment.mimeType}). Acknowledge and tell them to wait a moment while you check.]`,
         });
       }
     }
@@ -553,7 +520,7 @@ You must output valid JSON matching the requested schema:
 
   let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
   let lastError: unknown;
-  let modelUsed = 'gemini-4-hydrogen';
+  let modelUsed = 'gemini-2.5-flash-lite';
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
@@ -575,20 +542,28 @@ You must output valid JSON matching the requested schema:
     required: ['reply', 'handoffRequired', 'leadProfile'],
   };
 
-  // Primary Flash model with compact transient-only fallback (503 / 500 / 404 / timeout).
-  // HTTP 400 (invalid key) and HTTP 429 (quota exceeded) fail fast without looping across models.
+  // Minimum-usage Gemini runtime config:
+  // - Models: gemini-2.5-flash-lite (thinkingBudget: 0) -> gemini-3.5-flash (ThinkingLevel.MINIMAL)
+  // - Max Output Tokens: 120
+  // - Context window: last 6 messages
+  // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without looping across models
   const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
+  const MAX_OUTPUT_TOKENS = 120;
   const modelChain = [
-    { model: 'gemini-4-hydrogen', useLowThinking: true },
-    { model: 'gemini-3.8-flash', useLowThinking: true },
-    { model: 'gemini-3.5-flash-lite', useLowThinking: false },
-  ] as const;
+    { model: 'gemini-2.5-flash-lite', thinkingMode: 'budget_zero' as const },
+    { model: 'gemini-3.5-flash', thinkingMode: 'minimal' as const },
+    { model: 'gemini-3.1-flash-lite', thinkingMode: 'minimal' as const },
+  ];
 
   const tierErrors: string[] = [];
 
   for (let idx = 0; idx < modelChain.length; idx++) {
     const candidate = modelChain[idx];
     const candidateModel = candidate.model;
+    const thinkingConfig =
+      candidate.thinkingMode === 'budget_zero'
+        ? { thinkingBudget: 0 }
+        : { thinkingLevel: ThinkingLevel.MINIMAL };
 
     try {
       response = await withTimeout(
@@ -597,9 +572,8 @@ You must output valid JSON matching the requested schema:
           contents,
           config: {
             systemInstruction,
-            ...(candidate.useLowThinking
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : {}),
+            maxOutputTokens: MAX_OUTPUT_TOKENS,
+            thinkingConfig,
             responseMimeType: 'application/json',
             responseSchema,
           },
@@ -671,8 +645,26 @@ You must output valid JSON matching the requested schema:
   if (!rawText) {
     throw new GeminiApiError('TRANSIENT', 502, 'Model returned an empty response.');
   }
-  const parsed = JSON.parse(rawText) as ChatApiResponse;
-  return { ...parsed, modelUsed };
+
+  try {
+    const parsed = JSON.parse(rawText) as ChatApiResponse;
+    return { ...parsed, modelUsed };
+  } catch {
+    // Graceful extraction if tight maxOutputTokens ever clipped trailing JSON metadata
+    const replyMatch = rawText.match(/"reply"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (replyMatch?.[1]) {
+      const recoveredReply = JSON.parse(`"${replyMatch[1]}"`) as string;
+      const handoffRequired = /"handoffRequired"\s*:\s*true/.test(rawText);
+      return {
+        reply: recoveredReply,
+        handoffRequired,
+        handoffReason: handoffRequired ? 'Escalation triggered' : null,
+        leadProfile: currentLead,
+        modelUsed,
+      };
+    }
+    throw new GeminiApiError('TRANSIENT', 502, 'Model returned malformed JSON response.');
+  }
 }
 
 function isAllowedMetaMediaHost(hostname: string): boolean {
@@ -963,7 +955,7 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
   try {
     const historyForModel: ChatApiRequest['messages'] = existing.messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .slice(-16)
+      .slice(-6)
       .map((m, idx, arr) => ({
         role: m.role === 'assistant' ? 'assistant' : 'user',
         text: m.text,
