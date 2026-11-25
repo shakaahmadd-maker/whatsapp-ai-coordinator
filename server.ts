@@ -362,8 +362,8 @@ function buildSmartFallbackReply(
   }
 
   return isRomanUrdu
-    ? 'Ji bilkul, aaj kis subject ya deadline mein help chahiye?'
-    : 'Sure, what academic problem do you need help with today, and what is your subject or deadline?';
+    ? 'Salam! Aaj kis cheez mein help chahiye?'
+    : 'Hey! What are you working on today?';
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -466,8 +466,8 @@ async function generateAgentReply(
 
   const systemInstruction = `${buildSystemPrompt(config)}
 
-JSON OUTPUT (keep all fields ultra-short; reply <= 20 words, plain text):
-- reply: string (1-2 brief lines, max 20 words, plain text only)
+JSON OUTPUT (keep all fields ultra-short; reply <= 15 words, 1 sentence, max 1 question, plain text):
+- reply: string (1 brief sentence, max 15 words, plain text only)
 - handoffRequired: boolean
 - handoffReason: short string or null
 - leadProfile: merge ${JSON.stringify(currentLead)} -> {subject, academicLevel, goalTimeline, language, qualificationComplete}`;
@@ -544,11 +544,11 @@ JSON OUTPUT (keep all fields ultra-short; reply <= 20 words, plain text):
 
   // Minimum-usage Gemini runtime config:
   // - Models: gemini-2.5-flash-lite (thinkingBudget: 0) -> gemini-3.5-flash (ThinkingLevel.MINIMAL)
-  // - Max Output Tokens: 120
+  // - Max Output Tokens: 100 (within 70-100 budget)
   // - Context window: last 6 messages
   // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without looping across models
   const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
-  const MAX_OUTPUT_TOKENS = 120;
+  const MAX_OUTPUT_TOKENS = 100;
   const modelChain = [
     { model: 'gemini-2.5-flash-lite', thinkingMode: 'budget_zero' as const },
     { model: 'gemini-3.5-flash', thinkingMode: 'minimal' as const },
