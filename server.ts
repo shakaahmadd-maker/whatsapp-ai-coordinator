@@ -349,16 +349,28 @@ function buildSmartFallbackReply(
       lower
     );
 
-  if (isPricingOrUrgent) {
+  if (lead?.qualificationComplete) {
     return isRomanUrdu
-      ? 'Ek minute wait karein, main apni team se check kar ke abhi batati hoon.'
-      : 'Wait a moment, let me check with my team and get right back to you.';
+      ? 'Hamara specialist abhi review kar raha hai, jald update dungi.'
+      : 'Our specialist is still reviewing your details and will update you shortly.';
   }
 
-  if (lead?.subject || lead?.academicLevel) {
+  if (lead?.subject && !lead?.goalTimeline) {
     return isRomanUrdu
-      ? 'Ek minute wait karein, main apni team se check kar ke abhi batati hoon.'
-      : 'Wait a moment, let me check with my team and get right back to you.';
+      ? 'Iski exact deadline kya hai?'
+      : 'What is your exact deadline for this?';
+  }
+
+  if (!lead?.subject && lead?.goalTimeline) {
+    return isRomanUrdu
+      ? 'Ye kis subject ya topic ke liye hai?'
+      : 'Which subject or topic is this for?';
+  }
+
+  if (isPricingOrUrgent) {
+    return isRomanUrdu
+      ? 'Exact quote ke liye pehle subject aur details share kar dein.'
+      : 'Could you share the subject or file first so I can check exact pricing?';
   }
 
   return isRomanUrdu
@@ -466,8 +478,8 @@ async function generateAgentReply(
 
   const systemInstruction = `${buildSystemPrompt(config)}
 
-JSON OUTPUT (keep all fields ultra-short; reply <= 15 words, 1 sentence, max 1 question, plain text):
-- reply: string (1 brief sentence, max 15 words, plain text only)
+JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, never repeat answered questions or say "Wait a moment" until all checklist items are collected):
+- reply: string
 - handoffRequired: boolean
 - handoffReason: short string or null
 - leadProfile: merge ${JSON.stringify(currentLead)} -> {subject, academicLevel, goalTimeline, language, qualificationComplete}`;
@@ -543,16 +555,14 @@ JSON OUTPUT (keep all fields ultra-short; reply <= 15 words, 1 sentence, max 1 q
   };
 
   // Minimum-usage Gemini runtime config:
-  // - Models: gemini-2.5-flash-lite (thinkingBudget: 0) -> gemini-3.5-flash (ThinkingLevel.MINIMAL)
+  // - Model: gemini-2.5-flash-lite (thinkingBudget: 0)
   // - Max Output Tokens: 100 (within 70-100 budget)
   // - Context window: last 6 messages
-  // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without looping across models
+  // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without retries
   const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
   const MAX_OUTPUT_TOKENS = 100;
   const modelChain = [
     { model: 'gemini-2.5-flash-lite', thinkingMode: 'budget_zero' as const },
-    { model: 'gemini-3.5-flash', thinkingMode: 'minimal' as const },
-    { model: 'gemini-3.1-flash-lite', thinkingMode: 'minimal' as const },
   ];
 
   const tierErrors: string[] = [];
