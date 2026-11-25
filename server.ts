@@ -532,7 +532,7 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
 
   let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
   let lastError: unknown;
-  let modelUsed = 'gemini-2.5-flash-lite';
+  let modelUsed = 'gemini-3.5-flash-lite';
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
@@ -555,25 +555,23 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
   };
 
   // Minimum-usage Gemini runtime config:
-  // - Model: gemini-2.5-flash-lite (thinkingBudget: 0)
-  // - Max Output Tokens: 100 (within 70-100 budget)
+  // - Primary: gemini-3.5-flash-lite (recommended replacement for retired gemini-2.5-flash-lite)
+  // - Transient-only fallbacks (503/500/404/timeout): gemini-3.1-flash-lite -> gemini-4-hydrogen
+  // - Max Output Tokens: 100 on flash-lite tiers (256 on gemini-4-hydrogen to accommodate low thinking)
   // - Context window: last 6 messages
   // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without retries
   const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
-  const MAX_OUTPUT_TOKENS = 100;
   const modelChain = [
-    { model: 'gemini-2.5-flash-lite', thinkingMode: 'budget_zero' as const },
-  ];
+    { model: 'gemini-3.5-flash-lite', thinkingLevel: undefined, maxOutputTokens: 100 },
+    { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, maxOutputTokens: 100 },
+    { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, maxOutputTokens: 256 },
+  ] as const;
 
   const tierErrors: string[] = [];
 
   for (let idx = 0; idx < modelChain.length; idx++) {
     const candidate = modelChain[idx];
     const candidateModel = candidate.model;
-    const thinkingConfig =
-      candidate.thinkingMode === 'budget_zero'
-        ? { thinkingBudget: 0 }
-        : { thinkingLevel: ThinkingLevel.MINIMAL };
 
     try {
       response = await withTimeout(
@@ -582,8 +580,10 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
           contents,
           config: {
             systemInstruction,
-            maxOutputTokens: MAX_OUTPUT_TOKENS,
-            thinkingConfig,
+            maxOutputTokens: candidate.maxOutputTokens,
+            ...(candidate.thinkingLevel
+              ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
+              : {}),
             responseMimeType: 'application/json',
             responseSchema,
           },
