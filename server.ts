@@ -45,6 +45,7 @@ const DATA_DIR = process.env.DATA_DIR?.trim()
   ? path.resolve(process.env.DATA_DIR.trim())
   : path.resolve(__dirname, 'data');
 const STORE_PATH = path.resolve(DATA_DIR, 'store.json');
+const MEDIA_DIR = path.resolve(DATA_DIR, 'media');
 
 function cleanEnvValue(raw?: string): string {
   if (!raw) return '';
@@ -697,6 +698,78 @@ function getEffectiveGraphApiVersion(): string {
   return DEFAULT_GRAPH_API_VERSION;
 }
 
+const MIME_EXTENSION_MAP: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'video/mp4': '.mp4',
+  'video/3gpp': '.3gp',
+  'audio/ogg': '.ogg',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/amr': '.amr',
+  'audio/aac': '.aac',
+  'application/pdf': '.pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/msword': '.doc',
+  'text/plain': '.txt',
+};
+
+const EXTENSION_MIME_MAP: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.mp4': 'video/mp4',
+  '.3gp': 'video/3gpp',
+  '.ogg': 'audio/ogg',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.amr': 'audio/amr',
+  '.aac': 'audio/aac',
+  '.pdf': 'application/pdf',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.doc': 'application/msword',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+function saveIncomingMediaToDisk(
+  messageId: string,
+  mimeType: string,
+  base64Data: string,
+  originalFilename?: string
+): { mediaUrl: string; mediaMimeType: string } | null {
+  try {
+    const cleanMime = mimeType.toLowerCase().split(';')[0].trim() || 'application/octet-stream';
+    const origExt = originalFilename ? path.extname(originalFilename).toLowerCase() : '';
+    const safeOrigExt = /^\.[a-z0-9]{1,8}$/.test(origExt) ? origExt : '';
+    const ext = MIME_EXTENSION_MAP[cleanMime] || safeOrigExt || '.bin';
+
+    if (!fs.existsSync(MEDIA_DIR)) {
+      fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    }
+
+    const hash = crypto.createHash('sha1').update(messageId).digest('hex').slice(0, 16);
+    const fileName = `wa-${Date.now()}-${hash}${ext}`;
+    const targetPath = path.resolve(MEDIA_DIR, fileName);
+    if (!targetPath.startsWith(MEDIA_DIR + path.sep)) {
+      return null;
+    }
+
+    fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
+    return {
+      mediaUrl: `/api/whatsapp/media/${encodeURIComponent(fileName)}`,
+      mediaMimeType: cleanMime,
+    };
+  } catch (err) {
+    console.error('[Media persist error]', err);
+    return null;
+  }
+}
+
 async function downloadWhatsAppMedia(
   mediaId: string,
   accessToken: string
@@ -708,7 +781,11 @@ async function downloadWhatsAppMedia(
         headers: { Authorization: `Bearer ${accessToken}` },
       }
     );
-    if (!metaInfoRes.ok) return null;
+    if (!metaInfoRes.ok) {
+      const errText = await metaInfoRes.text().catch(() => '');
+      console.warn('[WhatsApp Media metadata fetch failed]', metaInfoRes.status, errText.slice(0, 180));
+      return null;
+    }
     const info = (await metaInfoRes.json()) as { url?: string; mime_type?: string };
     if (!info.url) return null;
 
@@ -721,7 +798,10 @@ async function downloadWhatsAppMedia(
     const mediaRes = await fetch(parsedUrl.toString(), {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!mediaRes.ok) return null;
+    if (!mediaRes.ok) {
+      console.warn('[WhatsApp Media binary download failed]', mediaRes.status);
+      return null;
+    }
     const arrayBuffer = await mediaRes.arrayBuffer();
     const base64Data = Buffer.from(arrayBuffer).toString('base64');
     return {
@@ -812,7 +892,11 @@ function isBusinessSelfNumber(normalizedDigits: string): boolean {
 async function sendWhatsAppTextMessage(
   toPhone: string,
   bodyText: string
-): Promise<{ status: 'sent' | 'simulated' | 'failed' | 'skipped_self'; error?: string }> {
+): Promise<{
+  status: 'sent' | 'simulated' | 'failed' | 'skipped_self';
+  waMessageId?: string;
+  error?: string;
+}> {
   const normalizedRecipient = toPhone.replace(/\D/g, '');
   if (!normalizedRecipient) {
     return { status: 'failed', error: 'Recipient phone number is empty or invalid.' };
@@ -865,17 +949,25 @@ async function sendWhatsAppTextMessage(
       }
     );
 
+    const rawBody = await response.text();
     if (!response.ok) {
-      const errBody = await response.text();
-      const friendlyError = formatMetaGraphError(response.status, errBody);
-      console.error('[WhatsApp Graph API send error]', response.status, friendlyError, errBody);
+      const friendlyError = formatMetaGraphError(response.status, rawBody);
+      console.error('[WhatsApp Graph API send error]', response.status, friendlyError, rawBody);
       return {
         status: 'failed',
         error: friendlyError,
       };
     }
 
-    return { status: 'sent' };
+    let waMessageId: string | undefined;
+    try {
+      const parsed = JSON.parse(rawBody) as { messages?: Array<{ id?: string }> };
+      waMessageId = parsed.messages?.[0]?.id;
+    } catch {
+      // Ignore parse failure if Graph API returned non-JSON 200
+    }
+
+    return { status: 'sent', waMessageId };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Network error sending WhatsApp message';
     console.error('[WhatsApp Graph API network error]', message);
@@ -883,13 +975,15 @@ async function sendWhatsAppTextMessage(
   }
 }
 
-async function markWhatsAppMessageRead(messageId: string): Promise<void> {
+async function markWhatsAppMessageRead(messageId: string): Promise<boolean> {
   const token = cleanEnvValue(process.env.WHATSAPP_ACCESS_TOKEN);
   const phoneIdCheck = getEffectivePhoneNumberId();
-  if (!token || !phoneIdCheck.valid || !messageId || messageId.startsWith('wamid.test.')) return;
+  if (!token || !phoneIdCheck.valid || !messageId || messageId.startsWith('wamid.test.')) {
+    return false;
+  }
 
   try {
-    await fetch(
+    const res = await fetch(
       `https://graph.facebook.com/${getEffectiveGraphApiVersion()}/${encodeURIComponent(phoneIdCheck.cleaned)}/messages`,
       {
         method: 'POST',
@@ -904,9 +998,87 @@ async function markWhatsAppMessageRead(messageId: string): Promise<void> {
         }),
       }
     );
+    return res.ok;
   } catch {
     // Non-critical read receipt
+    return false;
   }
+}
+
+const DELIVERY_RANK: Record<string, number> = {
+  simulated: 0,
+  skipped_self: 0,
+  sent: 1,
+  delivered: 2,
+  read: 3,
+};
+
+interface MetaStatusWebhookEntry {
+  id?: string;
+  status?: string;
+  recipient_id?: string;
+  errors?: Array<{ code?: number; title?: string; message?: string }>;
+}
+
+function applyWhatsAppStatusUpdates(statuses: MetaStatusWebhookEntry[]): number {
+  let updatedCount = 0;
+  for (const st of statuses) {
+    const wamid = st.id?.trim();
+    const rawStatus = st.status?.toLowerCase().trim();
+    if (!wamid || !rawStatus) continue;
+
+    let mappedStatus: 'sent' | 'delivered' | 'read' | 'failed' | null = null;
+    if (rawStatus === 'sent') mappedStatus = 'sent';
+    else if (rawStatus === 'delivered') mappedStatus = 'delivered';
+    else if (rawStatus === 'read') mappedStatus = 'read';
+    else if (rawStatus === 'failed') mappedStatus = 'failed';
+    if (!mappedStatus) continue;
+
+    const recipientDigits = st.recipient_id?.replace(/\D/g, '');
+    const candidateConvs =
+      recipientDigits && store.conversations[recipientDigits]
+        ? [store.conversations[recipientDigits], ...Object.values(store.conversations)]
+        : Object.values(store.conversations);
+
+    const seenPhones = new Set<string>();
+    for (const conv of candidateConvs) {
+      if (seenPhones.has(conv.phone)) continue;
+      seenPhones.add(conv.phone);
+
+      const targetMsg = conv.messages.find(
+        (m) => m.waMessageId === wamid || m.id === wamid
+      );
+      if (!targetMsg) continue;
+
+      if (mappedStatus === 'failed') {
+        const errInfo = st.errors?.[0];
+        const errDetail =
+          errInfo?.message || errInfo?.title || (errInfo?.code ? `Meta error ${errInfo.code}` : 'Delivery failed');
+        if (targetMsg.deliveryStatus !== 'failed' || targetMsg.deliveryError !== errDetail) {
+          targetMsg.deliveryStatus = 'failed';
+          targetMsg.deliveryError = errDetail;
+          updatedCount++;
+        }
+      } else {
+        const currentRank = DELIVERY_RANK[targetMsg.deliveryStatus || 'sent'] ?? 0;
+        const nextRank = DELIVERY_RANK[mappedStatus] ?? 0;
+        if (nextRank > currentRank) {
+          targetMsg.deliveryStatus = mappedStatus;
+          if (targetMsg.deliveryError) {
+            delete targetMsg.deliveryError;
+          }
+          updatedCount++;
+        }
+      }
+      break;
+    }
+  }
+
+  if (updatedCount > 0) {
+    persistStore();
+    broadcastSnapshot();
+  }
+  return updatedCount;
 }
 
 interface IncomingWhatsAppParams {
@@ -919,10 +1091,13 @@ interface IncomingWhatsAppParams {
     mimeType: string;
     base64Data: string;
   };
+  mediaUrl?: string;
+  mediaMimeType?: string;
+  mediaKind?: 'image' | 'video' | 'audio' | 'document' | 'sticker';
 }
 
 async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): Promise<void> {
-  const { messageId, contactName, text, attachment } = params;
+  const { messageId, contactName, text, attachment, mediaUrl, mediaMimeType, mediaKind } = params;
   const fromPhone = params.fromPhone.replace(/\D/g, '') || params.fromPhone;
   if (!rememberMessageId(messageId)) return;
 
@@ -944,19 +1119,29 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
 
   existing.contactName = contactName || existing.contactName;
   existing.lastActiveAt = new Date().toISOString();
-  existing.messages.push({
+  const userMsg: LiveConversation['messages'][number] = {
     id: messageId,
+    waMessageId: messageId,
     role: 'user',
-    text: text || (attachment ? `[Uploaded file: ${attachment.name}]` : ''),
+    text: text || (mediaUrl ? '' : attachment ? `[Uploaded file: ${attachment.name}]` : ''),
     timestamp: formatTimestamp(),
     attachmentName: attachment?.name,
-  });
+    mediaUrl,
+    mediaMimeType,
+    mediaKind,
+  };
+  existing.messages.push(userMsg);
 
   store.conversations[fromPhone] = existing;
   persistStore();
   broadcastSnapshot();
 
-  await markWhatsAppMessageRead(messageId);
+  const markedRead = await markWhatsAppMessageRead(messageId);
+  if (markedRead) {
+    userMsg.deliveryStatus = 'read';
+    persistStore();
+    broadcastSnapshot();
+  }
 
   if (existing.aiPaused) {
     return;
@@ -968,7 +1153,11 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
       .slice(-6)
       .map((m, idx, arr) => ({
         role: m.role === 'assistant' ? 'assistant' : 'user',
-        text: m.text,
+        text:
+          m.text ||
+          (m.mediaKind
+            ? `[Client sent ${m.mediaKind}: ${m.attachmentName || 'media file'}]`
+            : '[Media attachment]'),
         attachment: idx === arr.length - 1 ? attachment : undefined,
       }));
 
@@ -982,6 +1171,7 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
 
     const replyMessage = {
       id: `ai-${Date.now()}`,
+      waMessageId: delivery.waMessageId,
       role: 'assistant' as const,
       text: aiResult.reply,
       timestamp: formatTimestamp(),
@@ -1013,7 +1203,7 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
         status: 'Pending',
         transcript: existing.messages.map((m) => ({
           role: m.role,
-          text: m.text,
+          text: m.text || (m.attachmentName ? `[${m.mediaKind || 'file'}: ${m.attachmentName}]` : ''),
           timestamp: m.timestamp,
         })),
       };
@@ -1027,10 +1217,11 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
     const errorMsg = err instanceof Error ? err.message : 'AI generation error';
     console.error('[Webhook AI error]', errorMsg);
     const fallbackReply = buildSmartFallbackReply(text, store.config, existing.leadProfile);
-    // Still dispatch bilingual fallback reply to real external numbers; keep Gemini error separate from Meta delivery status
+    // Still dispatch fallback reply to real external numbers; keep Gemini error separate from Meta delivery status
     const delivery = await sendWhatsAppTextMessage(fromPhone, fallbackReply);
     existing.messages.push({
       id: `fallback-${Date.now()}`,
+      waMessageId: delivery.waMessageId,
       role: 'assistant',
       text: fallbackReply,
       timestamp: formatTimestamp(),
@@ -1413,6 +1604,7 @@ app.post('/api/whatsapp/reply', async (req, res) => {
   const delivery = await sendWhatsAppTextMessage(conv.phone, text.trim());
   conv.messages.push({
     id: `human-${Date.now()}`,
+    waMessageId: delivery.waMessageId,
     role: 'human_agent',
     text: text.trim(),
     timestamp: formatTimestamp(),
@@ -1423,6 +1615,40 @@ app.post('/api/whatsapp/reply', async (req, res) => {
   persistStore();
   broadcastSnapshot();
   res.json({ conversation: conv, delivery });
+});
+
+// Serve saved incoming WhatsApp media securely from DATA_DIR/media
+app.get('/api/whatsapp/media/:fileName', (req, res) => {
+  const rawName = req.params.fileName || '';
+  if (!/^[a-zA-Z0-9._-]+$/.test(rawName)) {
+    res.status(400).json({ error: 'Invalid media filename.' });
+    return;
+  }
+  const resolvedPath = path.resolve(MEDIA_DIR, rawName);
+  if (!resolvedPath.startsWith(MEDIA_DIR + path.sep)) {
+    res.status(403).json({ error: 'Forbidden media path.' });
+    return;
+  }
+  if (!fs.existsSync(resolvedPath)) {
+    res.status(404).json({ error: 'Media file not found.' });
+    return;
+  }
+
+  const ext = path.extname(resolvedPath).toLowerCase();
+  const mime = EXTENSION_MIME_MAP[ext] || 'application/octet-stream';
+  const safeInline =
+    mime.startsWith('image/') ||
+    mime.startsWith('video/') ||
+    mime.startsWith('audio/') ||
+    mime === 'application/pdf';
+
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Type', mime);
+  res.setHeader(
+    'Content-Disposition',
+    `${safeInline ? 'inline' : 'attachment'}; filename="${rawName}"`
+  );
+  res.sendFile(resolvedPath);
 });
 
 // Pause or resume AI auto-replies for a conversation
@@ -1533,7 +1759,7 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
       changes?: Array<{
         value?: {
           contacts?: Array<{ wa_id?: string; profile?: { name?: string } }>;
-          statuses?: Array<{ id?: string; status?: string }>;
+          statuses?: Array<MetaStatusWebhookEntry>;
           messages?: Array<{
             id?: string;
             from?: string;
@@ -1545,6 +1771,9 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
               list_reply?: { title?: string };
             };
             image?: { id?: string; caption?: string; mime_type?: string };
+            sticker?: { id?: string; mime_type?: string };
+            video?: { id?: string; caption?: string; mime_type?: string };
+            audio?: { id?: string; mime_type?: string };
             document?: { id?: string; caption?: string; filename?: string; mime_type?: string };
           }>;
         };
@@ -1560,7 +1789,10 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
 
   let messageCount = 0;
   let statusCount = 0;
+  let statusUpdatesApplied = 0;
   const senderPhones: string[] = [];
+  const allStatuses: MetaStatusWebhookEntry[] = [];
+
   for (const entry of payload.entry) {
     for (const change of entry.changes || []) {
       const value = change.value;
@@ -1572,8 +1804,13 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
       }
       if (value?.statuses?.length) {
         statusCount += value.statuses.length;
+        allStatuses.push(...value.statuses);
       }
     }
+  }
+
+  if (allStatuses.length > 0) {
+    statusUpdatesApplied = applyWhatsAppStatusUpdates(allStatuses);
   }
 
   if (messageCount === 0) {
@@ -1582,7 +1819,7 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
       200,
       'statuses_only',
       statusCount > 0
-        ? `Ignored ${statusCount} delivery/read status update(s).`
+        ? `Processed ${statusCount} status receipt(s) (${statusUpdatesApplied} message(s) updated).`
         : 'Received empty WhatsApp webhook event.'
     );
     res.sendStatus(200);
@@ -1625,6 +1862,9 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
           const contactName = contactsMap.get(msg.from) || msg.from;
           let text = '';
           let attachment: IncomingWhatsAppParams['attachment'];
+          let mediaUrl: string | undefined;
+          let mediaMimeType: string | undefined;
+          let mediaKind: IncomingWhatsAppParams['mediaKind'];
 
           if (msg.type === 'text' && msg.text?.body) {
             text = msg.text.body;
@@ -1637,6 +1877,7 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
               '[Interactive selection]';
           } else if (msg.type === 'image' && msg.image?.id) {
             text = msg.image.caption || '';
+            mediaKind = 'image';
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.image.id, accessToken);
               if (media) {
@@ -1645,23 +1886,87 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
                   mimeType: media.mimeType,
                   base64Data: media.base64Data,
                 };
+                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                if (saved) {
+                  mediaUrl = saved.mediaUrl;
+                  mediaMimeType = saved.mediaMimeType;
+                }
               } else if (!text) {
                 text =
                   '[Client sent an image that could not be downloaded cleanly. Ask them politely to resend a clear photo or paste the details.]';
               }
             }
+          } else if (msg.type === 'sticker' && msg.sticker?.id) {
+            mediaKind = 'sticker';
+            if (accessToken) {
+              const media = await downloadWhatsAppMedia(msg.sticker.id, accessToken);
+              if (media) {
+                attachment = {
+                  name: 'whatsapp-sticker',
+                  mimeType: media.mimeType,
+                  base64Data: media.base64Data,
+                };
+                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                if (saved) {
+                  mediaUrl = saved.mediaUrl;
+                  mediaMimeType = saved.mediaMimeType;
+                }
+              }
+            }
+          } else if (msg.type === 'video' && msg.video?.id) {
+            text = msg.video.caption || '';
+            mediaKind = 'video';
+            if (accessToken) {
+              const media = await downloadWhatsAppMedia(msg.video.id, accessToken);
+              if (media) {
+                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                if (saved) {
+                  mediaUrl = saved.mediaUrl;
+                  mediaMimeType = saved.mediaMimeType;
+                }
+              } else if (!text) {
+                text = '[Client sent a video that could not be downloaded cleanly.]';
+              }
+            }
+          } else if (msg.type === 'audio' && msg.audio?.id) {
+            mediaKind = 'audio';
+            if (accessToken) {
+              const media = await downloadWhatsAppMedia(msg.audio.id, accessToken);
+              if (media) {
+                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                if (saved) {
+                  mediaUrl = saved.mediaUrl;
+                  mediaMimeType = saved.mediaMimeType;
+                }
+              } else {
+                text = '[Client sent a voice note that could not be downloaded cleanly.]';
+              }
+            }
           } else if (msg.type === 'document' && msg.document?.id) {
             text = msg.document.caption || '';
+            mediaKind = 'document';
+            const docFilename = msg.document.filename || 'whatsapp-document';
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.document.id, accessToken);
               if (media) {
+                const resolvedMime = msg.document.mime_type || media.mimeType;
                 attachment = {
-                  name: msg.document.filename || 'whatsapp-document',
-                  mimeType: msg.document.mime_type || media.mimeType,
+                  name: docFilename,
+                  mimeType: resolvedMime,
                   base64Data: media.base64Data,
                 };
+                const saved = saveIncomingMediaToDisk(
+                  msg.id,
+                  resolvedMime,
+                  media.base64Data,
+                  docFilename
+                );
+                if (saved) {
+                  mediaUrl = saved.mediaUrl;
+                  mediaMimeType = saved.mediaMimeType;
+                }
               } else if (!text) {
-                text = `[Client sent document "${msg.document.filename || 'file'}", which could not be downloaded cleanly. Ask them politely to resend as a PDF/photo or paste key details.]`;
+                text = `[Client sent document "${docFilename}", which could not be downloaded cleanly. Ask them politely to resend as a PDF/photo or paste key details.]`;
               }
             }
           } else {
@@ -1674,6 +1979,9 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
             contactName,
             text,
             attachment,
+            mediaUrl,
+            mediaMimeType,
+            mediaKind,
           });
         }
       }

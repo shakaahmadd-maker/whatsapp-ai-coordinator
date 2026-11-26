@@ -152,7 +152,21 @@ export default function App() {
                 id: msg.id,
                 phone: conv.phone,
                 contactName: conv.contactName || conv.phone,
-                text: msg.text || (msg.attachmentName ? `Sent file: ${msg.attachmentName}` : 'New message'),
+                text:
+                  msg.text ||
+                  (msg.attachmentName
+                    ? `Sent file: ${msg.attachmentName}`
+                    : msg.mediaKind === 'image'
+                    ? 'Sent a photo'
+                    : msg.mediaKind === 'video'
+                    ? 'Sent a video'
+                    : msg.mediaKind === 'audio'
+                    ? 'Sent a voice note'
+                    : msg.mediaKind === 'sticker'
+                    ? 'Sent a sticker'
+                    : msg.mediaKind === 'document'
+                    ? 'Sent a document'
+                    : 'New message'),
                 timestamp: msg.timestamp || formatTimeNow(),
               });
             }

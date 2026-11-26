@@ -74,14 +74,24 @@ export interface EscalationTicket {
 
 export interface LiveConversationMessage {
   id: string;
+  waMessageId?: string;
   role: 'user' | 'assistant' | 'human_agent';
   text: string;
   timestamp: string;
-  deliveryStatus?: 'sent' | 'simulated' | 'failed' | 'skipped_self';
+  deliveryStatus?:
+    | 'sent'
+    | 'delivered'
+    | 'read'
+    | 'simulated'
+    | 'failed'
+    | 'skipped_self';
   deliveryError?: string;
   aiError?: string;
   aiModelUsed?: string;
   attachmentName?: string;
+  mediaUrl?: string;
+  mediaMimeType?: string;
+  mediaKind?: 'image' | 'video' | 'audio' | 'document' | 'sticker';
   handoffTriggered?: boolean;
 }
 
