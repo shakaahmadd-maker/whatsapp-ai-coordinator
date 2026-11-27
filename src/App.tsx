@@ -317,6 +317,36 @@ export default function App() {
     });
   };
 
+  const handleSaveChatInstructions = async (phone: string, instructions: string) => {
+    const res = await fetch(
+      `/api/whatsapp/conversations/${encodeURIComponent(phone)}/instructions`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instructions }),
+      }
+    );
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.error || 'Failed to save chat instructions.');
+    }
+  };
+
+  const handleTriggerAiFollowUp = async (phone: string, instructions: string) => {
+    const res = await fetch(
+      `/api/whatsapp/conversations/${encodeURIComponent(phone)}/ai-followup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instructions }),
+      }
+    );
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.error || 'Failed to send AI follow-up.');
+    }
+  };
+
   const handleSavePhoneNumberId = async (
     phoneNumberId: string,
     graphApiVersion?: string
@@ -643,6 +673,8 @@ export default function App() {
             focusedPhone={focusedPhone}
             onSendManualReply={handleSendManualReply}
             onToggleAiPause={handleToggleAiPause}
+            onSaveChatInstructions={handleSaveChatInstructions}
+            onTriggerAiFollowUp={handleTriggerAiFollowUp}
             onTriggerTestIncoming={handleTriggerTestIncoming}
             onNavigateSetup={() => setActiveTab('setup')}
           />

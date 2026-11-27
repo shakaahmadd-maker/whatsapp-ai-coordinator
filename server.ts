@@ -359,7 +359,8 @@ function summarizeGeminiError(errStr: string): string {
 function buildSmartFallbackReply(
   studentText: string,
   cfg: KnowledgeBaseConfig,
-  lead?: LeadProfile
+  lead?: LeadProfile,
+  hasMedia?: boolean
 ): string {
   // First check if the student's message matches an enabled entry in the Q&A Knowledge Bank
   const matchedFaq = findBestMatchingFaq(studentText, cfg.faqItems);
@@ -372,6 +373,12 @@ function buildSmartFallbackReply(
     /\b(salam|assalam|aoa|mujhe|chahiye|hai|hain|kaise|kya|aap|mera|meri|karna|hoga|hogi|bhai|ji|shukriya|zaroorat|fees|kitni)\b/i.test(
       lower
     ) || lead?.language?.toLowerCase().includes('urdu');
+
+  if (hasMedia && !studentText.trim()) {
+    return isRomanUrdu
+      ? 'Main abhi ye file open nahi kar pa rahi — zara bata dein aapko kis subject mein help chahiye?'
+      : 'I could not review that file right now—could you tell me which academic task you need help with?';
+  }
 
   const isPricingOrUrgent =
     /\b(price|pricing|cost|fee|fees|charge|charges|rate|urgent|rush|asap|human|specialist|manager|call|team|kitni|paise)\b/i.test(
@@ -425,10 +432,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+function normalizeMimeType(mimeType?: string): string {
+  return (mimeType || '').toLowerCase().split(';')[0].trim();
+}
+
 function isGeminiSupportedInlineMime(mimeType: string): boolean {
-  const lower = mimeType.toLowerCase().split(';')[0].trim();
+  const lower = normalizeMimeType(mimeType);
   return (
     lower.startsWith('image/') ||
+    lower.startsWith('audio/') ||
+    lower.startsWith('video/') ||
     lower === 'application/pdf' ||
     lower.startsWith('text/')
   );
@@ -498,29 +511,51 @@ function extractDocxText(base64Data: string): string | null {
 async function generateAgentReply(
   config: KnowledgeBaseConfig,
   messages: ChatApiRequest['messages'],
-  currentLead: LeadProfile
+  currentLead: LeadProfile,
+  options?: {
+    chatInstructions?: string;
+    isProactiveFollowUp?: boolean;
+  }
 ): Promise<ChatApiResponse> {
   const ai = getGeminiClient();
 
   // Keep context window strictly to the last 6 messages to minimize token usage
   const recentMessages = messages.slice(-6);
+  const cleanedChatInstructions = options?.chatInstructions?.trim().slice(0, 2000) || '';
 
-  const systemInstruction = `${buildSystemPrompt(config)}
+  const perChatSection = cleanedChatInstructions
+    ? `\n\nPER-CHAT COORDINATOR INSTRUCTIONS (HIGHEST PRIORITY FOR THIS SPECIFIC STUDENT/CHAT — follow these exact instructions for this student alongside safety/media verification rules):\n${cleanedChatInstructions}`
+    : '';
 
-JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, never repeat answered questions or say "Wait a moment" until all checklist items are collected):
-- reply: string
-- handoffRequired: boolean
+  const proactiveSection = options?.isProactiveFollowUp
+    ? `\n\nPROACTIVE FOLLOW-UP MODE: You are initiating a short, natural follow-up message right now to this student based on the chat history and the PER-CHAT COORDINATOR INSTRUCTIONS above. Do not greet from scratch if you already chatted—continue naturally.`
+    : '';
+
+  const systemInstruction = `${buildSystemPrompt(config)}${perChatSection}${proactiveSection}
+
+JSON OUTPUT (inspect any attached media FIRST before writing reply; keep reply brief 1-2 plain-text lines, max 18 words unless per-chat instructions require specific details, max 1 question, never repeat answered questions):
+- mediaRelevance: "relevant" | "irrelevant_or_spam" | "unreadable" | "none" (evaluate the attached image/sticker/audio/video/document first; use "irrelevant_or_spam" for memes, jokes, pranks, random unrelated photos, or spam; use "none" if no media)
+- mediaSummary: short <=12 word factual note of what the media actually shows/says, or null if no media
+- reply: string (MUST directly match your mediaRelevance judgment and any per-chat instructions)
+- handoffRequired: boolean (ALWAYS false when mediaRelevance is "irrelevant_or_spam")
 - handoffReason: short string or null
 - leadProfile: merge ${JSON.stringify(currentLead)} -> {subject, academicLevel, goalTimeline, language, qualificationComplete}`;
+
+  const MAX_INLINE_BASE64_LEN = 14 * 1024 * 1024; // ~10MB binary ceiling for inlineData
+  let hasMediaPayload = false;
 
   const contents = recentMessages.map((msg) => {
     const parts: Array<Record<string, unknown>> = [];
     if (msg.attachment?.base64Data && msg.attachment?.mimeType) {
-      const mime = msg.attachment.mimeType.toLowerCase();
-      if (isGeminiSupportedInlineMime(mime)) {
+      const mime = normalizeMimeType(msg.attachment.mimeType);
+      if (
+        isGeminiSupportedInlineMime(mime) &&
+        msg.attachment.base64Data.length <= MAX_INLINE_BASE64_LEN
+      ) {
+        hasMediaPayload = true;
         parts.push({
           inlineData: {
-            mimeType: msg.attachment.mimeType,
+            mimeType: mime,
             data: msg.attachment.base64Data,
           },
         });
@@ -528,19 +563,20 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
         mime.includes('wordprocessingml.document') ||
         msg.attachment.name.toLowerCase().endsWith('.docx')
       ) {
+        hasMediaPayload = true;
         const extracted = extractDocxText(msg.attachment.base64Data);
         if (extracted) {
           parts.push({
-            text: `[Attached DOCX "${msg.attachment.name}"]:\n${extracted.slice(0, 2000)}`,
+            text: `[Attached DOCX "${msg.attachment.name}" — read and verify relevance first]:\n${extracted.slice(0, 2000)}`,
           });
         } else {
           parts.push({
-            text: `[Client sent DOCX "${msg.attachment.name}" (unreadable). Ask for PDF/photo or pasted text.]`,
+            text: `[Client sent DOCX "${msg.attachment.name}" that could not be parsed. Set mediaRelevance="unreadable" and ask for PDF/photo or pasted text.]`,
           });
         }
       } else {
         parts.push({
-          text: `[Client sent file "${msg.attachment.name}" (${msg.attachment.mimeType}). Acknowledge and tell them to wait a moment while you check.]`,
+          text: `[Client sent file "${msg.attachment.name}" (${mime || 'unknown'}) which could not be inspected inline. Ask them to resend as a clear photo/PDF or explain what academic task they need.]`,
         });
       }
     }
@@ -552,6 +588,10 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
           ? `[Uploaded file: ${msg.attachment.name}]`
           : '[Empty message received]',
       });
+    } else if (msg.role === 'user') {
+      parts.push({
+        text: '[Client sent this media without a text caption. Inspect the media content carefully first, judge whether it is real academic material or irrelevant/meme/spam, and reply accordingly.]',
+      });
     }
     return {
       role: msg.role === 'assistant' ? 'model' : 'user',
@@ -559,12 +599,65 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
     };
   });
 
+  if (options?.isProactiveFollowUp) {
+    contents.push({
+      role: 'user',
+      parts: [
+        {
+          text: '[COORDINATOR TRIGGER: Send a brief, natural WhatsApp follow-up message to this student now following the PER-CHAT COORDINATOR INSTRUCTIONS.]',
+        },
+      ],
+    });
+  }
+
   let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
   let lastError: unknown;
   let modelUsed = 'gemini-3.5-flash-lite';
+  let activeContents = contents;
+  let strippedUnreadableMedia = false;
+
+  const stripInlineMediaFromContents = (
+    input: Array<{ role: string; parts: Array<Record<string, unknown>> }>
+  ) =>
+    input.map((turn) => {
+      const nextParts: Array<Record<string, unknown>> = [];
+      let hadInline = false;
+      for (const p of turn.parts) {
+        if ('inlineData' in p) {
+          hadInline = true;
+        } else {
+          nextParts.push(p);
+        }
+      }
+      if (hadInline) {
+        nextParts.unshift({
+          text: '[System: the client attached a media file (image/sticker/audio/video) that could not be decoded or opened. Do NOT assume it is an assignment. Set mediaRelevance="unreadable" and politely ask them to resend as a clear photo/PDF or explain their academic request in text.]',
+        });
+      }
+      return { role: turn.role, parts: nextParts };
+    });
+
+  const isMediaDecodeError = (errStr: string): boolean => {
+    const lower = errStr.toLowerCase();
+    return (
+      lower.includes('unable to process input') ||
+      lower.includes('invalid_argument') &&
+        (lower.includes('image') ||
+          lower.includes('audio') ||
+          lower.includes('video') ||
+          lower.includes('mime') ||
+          lower.includes('inline'))
+    );
+  };
+
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
+      mediaRelevance: {
+        type: Type.STRING,
+        enum: ['relevant', 'irrelevant_or_spam', 'unreadable', 'none'],
+      },
+      mediaSummary: { type: Type.STRING, nullable: true },
       reply: { type: Type.STRING },
       handoffRequired: { type: Type.BOOLEAN },
       handoffReason: { type: Type.STRING, nullable: true },
@@ -580,20 +673,28 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
         required: ['language', 'qualificationComplete'],
       },
     },
-    required: ['reply', 'handoffRequired', 'leadProfile'],
+    propertyOrdering: [
+      'mediaRelevance',
+      'mediaSummary',
+      'reply',
+      'handoffRequired',
+      'handoffReason',
+      'leadProfile',
+    ],
+    required: ['mediaRelevance', 'reply', 'handoffRequired', 'leadProfile'],
   };
 
   // Minimum-usage Gemini runtime config:
   // - Primary: gemini-3.5-flash-lite (recommended replacement for retired gemini-2.5-flash-lite)
   // - Transient-only fallbacks (503/500/404/timeout): gemini-3.1-flash-lite -> gemini-4-hydrogen
-  // - Max Output Tokens: 100 on flash-lite tiers (256 on gemini-4-hydrogen to accommodate low thinking)
+  // - Give multimodal requests enough time & output headroom to inspect media before replying
   // - Context window: last 6 messages
   // - HTTP 400 (invalid key) & HTTP 429 (quota) fail fast without retries
-  const GEMINI_ATTEMPT_TIMEOUT_MS = 10000;
+  const GEMINI_ATTEMPT_TIMEOUT_MS = hasMediaPayload ? 18000 : 10000;
   const modelChain = [
-    { model: 'gemini-3.5-flash-lite', thinkingLevel: undefined, maxOutputTokens: 100 },
-    { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, maxOutputTokens: 100 },
-    { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, maxOutputTokens: 256 },
+    { model: 'gemini-3.5-flash-lite', thinkingLevel: undefined, maxOutputTokens: 200 },
+    { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, maxOutputTokens: 200 },
+    { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, maxOutputTokens: 340 },
   ] as const;
 
   const tierErrors: string[] = [];
@@ -606,7 +707,7 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
       response = await withTimeout(
         ai.models.generateContent({
           model: candidateModel,
-          contents,
+          contents: activeContents,
           config: {
             systemInstruction,
             maxOutputTokens: candidate.maxOutputTokens,
@@ -638,6 +739,19 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
       // Fail fast on HTTP 429 quota exceeded — do not spam retries across models
       if (isQuotaExceededError(errStr)) {
         throw new GeminiApiError('QUOTA_EXHAUSTED', 429, shortReason);
+      }
+
+      // If an attached image/sticker/audio/video was corrupted or unsupported by Gemini's decoder,
+      // strip the undecodable inline bytes and retry cleanly on the same model so the chat never breaks.
+      if (hasMediaPayload && !strippedUnreadableMedia && isMediaDecodeError(errStr)) {
+        console.warn(
+          `[Gemini ${candidateModel} could not decode inline media; retrying with unreadable-media notice]`,
+          shortReason
+        );
+        strippedUnreadableMedia = true;
+        activeContents = stripInlineMediaFromContents(activeContents);
+        idx--;
+        continue;
       }
 
       tierErrors.push(`${candidateModel} (${shortReason})`);
@@ -687,6 +801,11 @@ JSON OUTPUT (reply <= 18 words, 1-2 brief lines, max 1 question, plain text, nev
 
   try {
     const parsed = JSON.parse(rawText) as ChatApiResponse;
+    // Safety guard: never hand off or mark qualified on irrelevant/spam media
+    if (parsed.mediaRelevance === 'irrelevant_or_spam') {
+      parsed.handoffRequired = false;
+      parsed.handoffReason = null;
+    }
     return { ...parsed, modelUsed };
   } catch {
     // Graceful extraction if tight maxOutputTokens ever clipped trailing JSON metadata
@@ -794,6 +913,42 @@ function saveIncomingMediaToDisk(
     };
   } catch (err) {
     console.error('[Media persist error]', err);
+    return null;
+  }
+}
+
+function loadMediaAttachmentFromDisk(
+  mediaUrl?: string,
+  fallbackMimeType?: string,
+  fallbackName?: string
+): { name: string; mimeType: string; base64Data: string } | null {
+  if (!mediaUrl || !mediaUrl.startsWith('/api/whatsapp/media/')) return null;
+  try {
+    const encodedName = mediaUrl.slice('/api/whatsapp/media/'.length);
+    const rawName = decodeURIComponent(encodedName);
+    if (!/^[a-zA-Z0-9._-]+$/.test(rawName)) return null;
+    const resolvedPath = path.resolve(MEDIA_DIR, rawName);
+    if (!resolvedPath.startsWith(MEDIA_DIR + path.sep)) return null;
+    if (!fs.existsSync(resolvedPath)) return null;
+
+    const stats = fs.statSync(resolvedPath);
+    if (!stats.isFile() || stats.size === 0 || stats.size > 8 * 1024 * 1024) {
+      return null;
+    }
+
+    const ext = path.extname(resolvedPath).toLowerCase();
+    const mimeType =
+      normalizeMimeType(fallbackMimeType) ||
+      EXTENSION_MIME_MAP[ext] ||
+      'application/octet-stream';
+    const base64Data = fs.readFileSync(resolvedPath).toString('base64');
+    return {
+      name: fallbackName || rawName,
+      mimeType,
+      base64Data,
+    };
+  } catch (err) {
+    console.warn('[Media reload from disk failed]', err);
     return null;
   }
 }
@@ -1213,10 +1368,216 @@ interface IncomingWhatsAppParams {
   mediaUrl?: string;
   mediaMimeType?: string;
   mediaKind?: 'image' | 'video' | 'audio' | 'document' | 'sticker';
+  mediaDownloadFailed?: boolean;
+  debounceMs?: number;
+}
+
+function buildHistoryForModel(
+  conv: LiveConversation,
+  latestAttachment?: IncomingWhatsAppParams['attachment']
+): ChatApiRequest['messages'] {
+  const recent = conv.messages
+    .filter((m) => m.role === 'user' || m.role === 'assistant' || m.role === 'human_agent')
+    .slice(-6);
+
+  // Attach inline media bytes for up to the 2 most recent media messages so Gemini always
+  // inspects the actual images/documents/audio/video sent in this burst or previous turn.
+  let mediaAttachedCount = 0;
+  const resolvedAttachments: Array<IncomingWhatsAppParams['attachment'] | undefined> = new Array(
+    recent.length
+  ).fill(undefined);
+
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const m = recent[i];
+    if (m.role !== 'user') continue;
+    if (mediaAttachedCount >= 2) break;
+
+    if (i === recent.length - 1 && latestAttachment?.base64Data) {
+      resolvedAttachments[i] = latestAttachment;
+      mediaAttachedCount++;
+    } else if (m.mediaUrl) {
+      const loaded = loadMediaAttachmentFromDisk(m.mediaUrl, m.mediaMimeType, m.attachmentName);
+      if (loaded) {
+        resolvedAttachments[i] = loaded;
+        mediaAttachedCount++;
+      }
+    }
+  }
+
+  return recent.map((m, idx) => {
+    const resolvedAtt = resolvedAttachments[idx];
+    let textForModel = m.text?.trim() || '';
+
+    if (m.mediaDownloadFailed) {
+      const note = `[System: client sent ${m.mediaKind || 'media'}${
+        m.attachmentName ? ` "${m.attachmentName}"` : ''
+      } but it failed to download. Do NOT pretend you saw it — set mediaRelevance="unreadable" and ask them to resend clearly.]`;
+      textForModel = textForModel ? `${textForModel}\n${note}` : note;
+    } else if (!textForModel && !resolvedAtt) {
+      textForModel = m.mediaKind
+        ? `[Client sent ${m.mediaKind}: ${m.attachmentName || 'media file'}]`
+        : '[Media attachment]';
+    }
+
+    return {
+      role: m.role === 'user' ? 'user' : 'assistant',
+      text: textForModel,
+      attachment: resolvedAtt,
+    };
+  });
+}
+
+async function generateAndSendConversationAiReply(
+  phone: string,
+  options?: {
+    latestAttachment?: IncomingWhatsAppParams['attachment'];
+    isProactiveFollowUp?: boolean;
+  }
+): Promise<{
+  conversation: LiveConversation;
+  replyMessage: LiveConversation['messages'][number];
+}> {
+  const existing = store.conversations[phone];
+  if (!existing) {
+    throw new Error('Conversation not found.');
+  }
+
+  const lastUserMsg = [...existing.messages].reverse().find((m) => m.role === 'user');
+  const fallbackSourceText = lastUserMsg?.text || '';
+  const lastHasMedia = Boolean(
+    options?.latestAttachment || lastUserMsg?.mediaUrl || lastUserMsg?.mediaKind
+  );
+
+  try {
+    const historyForModel = buildHistoryForModel(existing, options?.latestAttachment);
+
+    const aiResult = await generateAgentReply(
+      store.config,
+      historyForModel,
+      existing.leadProfile,
+      {
+        chatInstructions: existing.customInstructions,
+        isProactiveFollowUp: options?.isProactiveFollowUp,
+      }
+    );
+
+    const delivery = await sendWhatsAppTextMessage(phone, aiResult.reply);
+
+    const replyMessage: LiveConversation['messages'][number] = {
+      id: `ai-${Date.now()}`,
+      waMessageId: delivery.waMessageId,
+      role: 'assistant',
+      text: aiResult.reply,
+      timestamp: formatTimestamp(),
+      deliveryStatus: delivery.status,
+      deliveryError: delivery.error,
+      aiModelUsed: aiResult.modelUsed,
+      handoffTriggered: aiResult.handoffRequired,
+    };
+
+    existing.messages.push(replyMessage);
+    existing.lastActiveAt = new Date().toISOString();
+    if (aiResult.leadProfile) {
+      existing.leadProfile = aiResult.leadProfile;
+    }
+
+    if (aiResult.handoffRequired && !options?.isProactiveFollowUp) {
+      existing.aiPaused = true;
+      existing.handoffReason =
+        aiResult.handoffReason || 'Escalation protocol triggered';
+
+      const newTicket: EscalationTicket = {
+        id: `ESC-${String(store.tickets.length + 1).padStart(3, '0')}`,
+        createdAt: formatTimestamp(),
+        clientPhone: phone,
+        clientName: existing.contactName,
+        clientSummary:
+          fallbackSourceText ||
+          lastUserMsg?.attachmentName ||
+          (lastUserMsg?.mediaKind ? `[${lastUserMsg.mediaKind}]` : 'WhatsApp inquiry'),
+        reason: existing.handoffReason,
+        language: existing.leadProfile?.language || 'English',
+        status: 'Pending',
+        transcript: existing.messages.map((m) => ({
+          role: m.role,
+          text: m.text || (m.attachmentName ? `[${m.mediaKind || 'file'}: ${m.attachmentName}]` : ''),
+          timestamp: m.timestamp,
+        })),
+      };
+      store.tickets.unshift(newTicket);
+    }
+
+    store.conversations[phone] = existing;
+    persistStore();
+    broadcastSnapshot();
+    return { conversation: existing, replyMessage };
+  } catch (err) {
+    if (options?.isProactiveFollowUp) {
+      throw err;
+    }
+    const errorMsg = err instanceof Error ? err.message : 'AI generation error';
+    console.error('[Webhook AI error]', errorMsg);
+    const fallbackReply = buildSmartFallbackReply(
+      fallbackSourceText,
+      store.config,
+      existing.leadProfile,
+      lastHasMedia
+    );
+    // Still dispatch fallback reply to real external numbers; keep Gemini error separate from Meta delivery status
+    const delivery = await sendWhatsAppTextMessage(phone, fallbackReply);
+    const fallbackMessage: LiveConversation['messages'][number] = {
+      id: `fallback-${Date.now()}`,
+      waMessageId: delivery.waMessageId,
+      role: 'assistant',
+      text: fallbackReply,
+      timestamp: formatTimestamp(),
+      deliveryStatus: delivery.status,
+      deliveryError: delivery.error,
+      aiError: errorMsg,
+    };
+    existing.messages.push(fallbackMessage);
+    existing.lastActiveAt = new Date().toISOString();
+    store.conversations[phone] = existing;
+    persistStore();
+    broadcastSnapshot();
+    return { conversation: existing, replyMessage: fallbackMessage };
+  }
+}
+
+const pendingReplyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleConversationAiReply(
+  phone: string,
+  delayMs: number,
+  latestAttachment?: IncomingWhatsAppParams['attachment']
+): void {
+  const existingTimer = pendingReplyTimers.get(phone);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  const timer = setTimeout(() => {
+    pendingReplyTimers.delete(phone);
+    const conv = store.conversations[phone];
+    if (!conv || conv.aiPaused) return;
+    void generateAndSendConversationAiReply(phone, { latestAttachment }).catch((err) => {
+      console.error('[Scheduled AI reply error]', err);
+    });
+  }, delayMs);
+  pendingReplyTimers.set(phone, timer);
 }
 
 async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): Promise<void> {
-  const { messageId, contactName, text, attachment, mediaUrl, mediaMimeType, mediaKind } = params;
+  const {
+    messageId,
+    contactName,
+    text,
+    attachment,
+    mediaUrl,
+    mediaMimeType,
+    mediaKind,
+    mediaDownloadFailed,
+    debounceMs = 0,
+  } = params;
   const fromPhone = params.fromPhone.replace(/\D/g, '') || params.fromPhone;
   if (!rememberMessageId(messageId)) return;
 
@@ -1242,12 +1603,13 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
     id: messageId,
     waMessageId: messageId,
     role: 'user',
-    text: text || (mediaUrl ? '' : attachment ? `[Uploaded file: ${attachment.name}]` : ''),
+    text: text || (mediaUrl || mediaKind ? '' : attachment ? `[Uploaded file: ${attachment.name}]` : ''),
     timestamp: formatTimestamp(),
     attachmentName: attachment?.name,
     mediaUrl,
     mediaMimeType,
     mediaKind,
+    ...(mediaDownloadFailed ? { mediaDownloadFailed: true } : {}),
   };
   existing.messages.push(userMsg);
 
@@ -1281,93 +1643,14 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
     return;
   }
 
-  try {
-    const historyForModel: ChatApiRequest['messages'] = existing.messages
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .slice(-6)
-      .map((m, idx, arr) => ({
-        role: m.role === 'assistant' ? 'assistant' : 'user',
-        text:
-          m.text ||
-          (m.mediaKind
-            ? `[Client sent ${m.mediaKind}: ${m.attachmentName || 'media file'}]`
-            : '[Media attachment]'),
-        attachment: idx === arr.length - 1 ? attachment : undefined,
-      }));
-
-    const aiResult = await generateAgentReply(
-      store.config,
-      historyForModel,
-      existing.leadProfile
-    );
-
-    const delivery = await sendWhatsAppTextMessage(fromPhone, aiResult.reply);
-
-    const replyMessage = {
-      id: `ai-${Date.now()}`,
-      waMessageId: delivery.waMessageId,
-      role: 'assistant' as const,
-      text: aiResult.reply,
-      timestamp: formatTimestamp(),
-      deliveryStatus: delivery.status,
-      deliveryError: delivery.error,
-      aiModelUsed: aiResult.modelUsed,
-      handoffTriggered: aiResult.handoffRequired,
-    };
-
-    existing.messages.push(replyMessage);
-    existing.lastActiveAt = new Date().toISOString();
-    if (aiResult.leadProfile) {
-      existing.leadProfile = aiResult.leadProfile;
-    }
-
-    if (aiResult.handoffRequired) {
-      existing.aiPaused = true;
-      existing.handoffReason =
-        aiResult.handoffReason || 'Escalation protocol triggered';
-
-      const newTicket: EscalationTicket = {
-        id: `ESC-${String(store.tickets.length + 1).padStart(3, '0')}`,
-        createdAt: formatTimestamp(),
-        clientPhone: fromPhone,
-        clientName: existing.contactName,
-        clientSummary: text || attachment?.name || 'WhatsApp inquiry',
-        reason: existing.handoffReason,
-        language: existing.leadProfile?.language || 'English',
-        status: 'Pending',
-        transcript: existing.messages.map((m) => ({
-          role: m.role,
-          text: m.text || (m.attachmentName ? `[${m.mediaKind || 'file'}: ${m.attachmentName}]` : ''),
-          timestamp: m.timestamp,
-        })),
-      };
-      store.tickets.unshift(newTicket);
-    }
-
-    store.conversations[fromPhone] = existing;
-    persistStore();
-    broadcastSnapshot();
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : 'AI generation error';
-    console.error('[Webhook AI error]', errorMsg);
-    const fallbackReply = buildSmartFallbackReply(text, store.config, existing.leadProfile);
-    // Still dispatch fallback reply to real external numbers; keep Gemini error separate from Meta delivery status
-    const delivery = await sendWhatsAppTextMessage(fromPhone, fallbackReply);
-    existing.messages.push({
-      id: `fallback-${Date.now()}`,
-      waMessageId: delivery.waMessageId,
-      role: 'assistant',
-      text: fallbackReply,
-      timestamp: formatTimestamp(),
-      deliveryStatus: delivery.status,
-      deliveryError: delivery.error,
-      aiError: errorMsg,
-    });
-    existing.lastActiveAt = new Date().toISOString();
-    store.conversations[fromPhone] = existing;
-    persistStore();
-    broadcastSnapshot();
+  // Wait briefly on live webhooks so multi-part bursts (e.g. photo + caption or multiple photos)
+  // finish arriving before Gemini inspects all media and sends one cohesive reply.
+  if (debounceMs > 0) {
+    scheduleConversationAiReply(fromPhone, debounceMs, attachment);
+    return;
   }
+
+  await generateAndSendConversationAiReply(fromPhone, { latestAttachment: attachment });
 }
 
 function inspectAppSecretFormat(secret: string): string | null {
@@ -1848,6 +2131,79 @@ app.post('/api/whatsapp/toggle-ai', (req, res) => {
   res.json({ conversation: conv });
 });
 
+// Save or clear per-chat custom Gemini instructions for a specific student/conversation
+app.put('/api/whatsapp/conversations/:phone/instructions', (req, res) => {
+  const rawPhone = req.params.phone || '';
+  const normalizedPhone = rawPhone.replace(/\D/g, '') || rawPhone;
+  const conv = store.conversations[normalizedPhone] || store.conversations[rawPhone];
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found.' });
+    return;
+  }
+
+  const { instructions } = req.body as { instructions?: unknown };
+  if (typeof instructions !== 'string') {
+    res.status(400).json({ error: 'Instructions must be a string.' });
+    return;
+  }
+
+  const cleaned = instructions.trim().slice(0, 2000);
+  if (cleaned) {
+    conv.customInstructions = cleaned;
+    conv.customInstructionsUpdatedAt = formatTimestamp();
+  } else {
+    delete conv.customInstructions;
+    delete conv.customInstructionsUpdatedAt;
+  }
+
+  persistStore();
+  broadcastSnapshot();
+  res.json({ conversation: conv });
+});
+
+// Immediately generate and send a proactive WhatsApp follow-up using this chat's Gemini instructions
+app.post('/api/whatsapp/conversations/:phone/ai-followup', async (req, res) => {
+  const rawPhone = req.params.phone || '';
+  const normalizedPhone = rawPhone.replace(/\D/g, '') || rawPhone;
+  const conv = store.conversations[normalizedPhone] || store.conversations[rawPhone];
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found.' });
+    return;
+  }
+
+  const { instructions } = req.body as { instructions?: unknown };
+  if (typeof instructions === 'string') {
+    const cleaned = instructions.trim().slice(0, 2000);
+    if (cleaned) {
+      conv.customInstructions = cleaned;
+      conv.customInstructionsUpdatedAt = formatTimestamp();
+    } else {
+      delete conv.customInstructions;
+      delete conv.customInstructionsUpdatedAt;
+    }
+    persistStore();
+  }
+
+  if (!conv.customInstructions?.trim()) {
+    res.status(400).json({
+      error: 'Add chat-specific instructions first so Gemini knows what to follow up about.',
+    });
+    return;
+  }
+
+  try {
+    const result = await generateAndSendConversationAiReply(conv.phone, {
+      isProactiveFollowUp: true,
+    });
+    res.json(result);
+  } catch (err) {
+    const status = err instanceof GeminiApiError ? err.status : 500;
+    const message =
+      err instanceof Error ? err.message : 'Unable to generate AI follow-up right now.';
+    res.status(status).json({ error: message });
+  }
+});
+
 // Toggle escalation ticket status
 app.post('/api/whatsapp/tickets/:id/toggle', (req, res) => {
   const ticketId = req.params.id;
@@ -1864,25 +2220,64 @@ app.post('/api/whatsapp/tickets/:id/toggle', (req, res) => {
 
 // Simulate an inbound WhatsApp Cloud API event for testing end-to-end
 app.post('/api/whatsapp/test-incoming', async (req, res) => {
-  const { phone, contactName, text } = req.body as {
+  const { phone, contactName, text, attachment } = req.body as {
     phone?: string;
     contactName?: string;
     text?: string;
+    attachment?: {
+      name?: string;
+      mimeType?: string;
+      base64Data?: string;
+    };
   };
-  if (!text?.trim()) {
-    res.status(400).json({ error: 'Test message text is required.' });
+  const hasAttachment = Boolean(attachment?.base64Data && attachment?.mimeType);
+  if (!text?.trim() && !hasAttachment) {
+    res.status(400).json({ error: 'Test message text or attachment is required.' });
     return;
   }
 
   const targetPhone =
     (phone || DEFAULT_EXTERNAL_TEST_PHONE).replace(/\D/g, '') || DEFAULT_EXTERNAL_TEST_PHONE;
   const targetName = contactName?.trim() || 'Test WhatsApp Client';
+  const messageId = `wamid.test.${Date.now()}`;
+
+  let normalizedAttachment: IncomingWhatsAppParams['attachment'];
+  let mediaUrl: string | undefined;
+  let mediaMimeType: string | undefined;
+  let mediaKind: IncomingWhatsAppParams['mediaKind'];
+
+  if (hasAttachment && attachment?.base64Data && attachment?.mimeType) {
+    const cleanMime = normalizeMimeType(attachment.mimeType);
+    const attName = attachment.name?.trim() || 'test-upload';
+    normalizedAttachment = {
+      name: attName,
+      mimeType: cleanMime,
+      base64Data: attachment.base64Data,
+    };
+    mediaKind = cleanMime.startsWith('image/')
+      ? 'image'
+      : cleanMime.startsWith('video/')
+      ? 'video'
+      : cleanMime.startsWith('audio/')
+      ? 'audio'
+      : 'document';
+    const saved = saveIncomingMediaToDisk(messageId, cleanMime, attachment.base64Data, attName);
+    if (saved) {
+      mediaUrl = saved.mediaUrl;
+      mediaMimeType = saved.mediaMimeType;
+    }
+  }
 
   await processIncomingWhatsAppMessage({
-    messageId: `wamid.test.${Date.now()}`,
+    messageId,
     fromPhone: targetPhone,
     contactName: targetName,
-    text: text.trim(),
+    text: text?.trim() || '',
+    attachment: normalizedAttachment,
+    mediaUrl,
+    mediaMimeType,
+    mediaKind,
+    debounceMs: 0,
   });
 
   res.json({ ok: true, conversation: store.conversations[targetPhone] });
@@ -2040,6 +2435,7 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
           let mediaUrl: string | undefined;
           let mediaMimeType: string | undefined;
           let mediaKind: IncomingWhatsAppParams['mediaKind'];
+          let mediaDownloadFailed = false;
 
           if (msg.type === 'text' && msg.text?.body) {
             text = msg.text.body;
@@ -2056,37 +2452,44 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.image.id, accessToken);
               if (media) {
+                const cleanMime = normalizeMimeType(msg.image.mime_type || media.mimeType) || 'image/jpeg';
                 attachment = {
                   name: 'whatsapp-image',
-                  mimeType: media.mimeType,
+                  mimeType: cleanMime,
                   base64Data: media.base64Data,
                 };
-                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                const saved = saveIncomingMediaToDisk(msg.id, cleanMime, media.base64Data);
                 if (saved) {
                   mediaUrl = saved.mediaUrl;
                   mediaMimeType = saved.mediaMimeType;
                 }
-              } else if (!text) {
-                text =
-                  '[Client sent an image that could not be downloaded cleanly. Ask them politely to resend a clear photo or paste the details.]';
+              } else {
+                mediaDownloadFailed = true;
               }
+            } else {
+              mediaDownloadFailed = true;
             }
           } else if (msg.type === 'sticker' && msg.sticker?.id) {
             mediaKind = 'sticker';
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.sticker.id, accessToken);
               if (media) {
+                const cleanMime = normalizeMimeType(msg.sticker.mime_type || media.mimeType) || 'image/webp';
                 attachment = {
                   name: 'whatsapp-sticker',
-                  mimeType: media.mimeType,
+                  mimeType: cleanMime,
                   base64Data: media.base64Data,
                 };
-                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                const saved = saveIncomingMediaToDisk(msg.id, cleanMime, media.base64Data);
                 if (saved) {
                   mediaUrl = saved.mediaUrl;
                   mediaMimeType = saved.mediaMimeType;
                 }
+              } else {
+                mediaDownloadFailed = true;
               }
+            } else {
+              mediaDownloadFailed = true;
             }
           } else if (msg.type === 'video' && msg.video?.id) {
             text = msg.video.caption || '';
@@ -2094,28 +2497,44 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.video.id, accessToken);
               if (media) {
-                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                const cleanMime = normalizeMimeType(msg.video.mime_type || media.mimeType) || 'video/mp4';
+                attachment = {
+                  name: 'whatsapp-video',
+                  mimeType: cleanMime,
+                  base64Data: media.base64Data,
+                };
+                const saved = saveIncomingMediaToDisk(msg.id, cleanMime, media.base64Data);
                 if (saved) {
                   mediaUrl = saved.mediaUrl;
                   mediaMimeType = saved.mediaMimeType;
                 }
-              } else if (!text) {
-                text = '[Client sent a video that could not be downloaded cleanly.]';
+              } else {
+                mediaDownloadFailed = true;
               }
+            } else {
+              mediaDownloadFailed = true;
             }
           } else if (msg.type === 'audio' && msg.audio?.id) {
             mediaKind = 'audio';
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.audio.id, accessToken);
               if (media) {
-                const saved = saveIncomingMediaToDisk(msg.id, media.mimeType, media.base64Data);
+                const cleanMime = normalizeMimeType(msg.audio.mime_type || media.mimeType) || 'audio/ogg';
+                attachment = {
+                  name: 'whatsapp-audio',
+                  mimeType: cleanMime,
+                  base64Data: media.base64Data,
+                };
+                const saved = saveIncomingMediaToDisk(msg.id, cleanMime, media.base64Data);
                 if (saved) {
                   mediaUrl = saved.mediaUrl;
                   mediaMimeType = saved.mediaMimeType;
                 }
               } else {
-                text = '[Client sent a voice note that could not be downloaded cleanly.]';
+                mediaDownloadFailed = true;
               }
+            } else {
+              mediaDownloadFailed = true;
             }
           } else if (msg.type === 'document' && msg.document?.id) {
             text = msg.document.caption || '';
@@ -2124,7 +2543,9 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
             if (accessToken) {
               const media = await downloadWhatsAppMedia(msg.document.id, accessToken);
               if (media) {
-                const resolvedMime = msg.document.mime_type || media.mimeType;
+                const resolvedMime =
+                  normalizeMimeType(msg.document.mime_type || media.mimeType) ||
+                  'application/octet-stream';
                 attachment = {
                   name: docFilename,
                   mimeType: resolvedMime,
@@ -2140,9 +2561,11 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
                   mediaUrl = saved.mediaUrl;
                   mediaMimeType = saved.mediaMimeType;
                 }
-              } else if (!text) {
-                text = `[Client sent document "${docFilename}", which could not be downloaded cleanly. Ask them politely to resend as a PDF/photo or paste key details.]`;
+              } else {
+                mediaDownloadFailed = true;
               }
+            } else {
+              mediaDownloadFailed = true;
             }
           } else {
             text = `[Unsupported WhatsApp message type: ${msg.type || 'unknown'}]`;
@@ -2157,6 +2580,8 @@ const handleWhatsAppWebhookPost = async (req: Request, res: Response) => {
             mediaUrl,
             mediaMimeType,
             mediaKind,
+            mediaDownloadFailed,
+            debounceMs: isServerlessCloudRun ? 0 : 2000,
           });
         }
       }

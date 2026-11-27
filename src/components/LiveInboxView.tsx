@@ -17,6 +17,10 @@ import {
   Image as ImageIcon,
   Film,
   Volume2,
+  Sparkles,
+  ChevronDown,
+  ChevronUp,
+  Save,
 } from 'lucide-react';
 import type { LiveConversation, LiveConversationMessage } from '../types/agent';
 import { WhatsAppText } from './WhatsAppText';
@@ -26,6 +30,8 @@ interface LiveInboxViewProps {
   focusedPhone?: string | null;
   onSendManualReply: (phone: string, text: string) => Promise<void>;
   onToggleAiPause: (phone: string, aiPaused: boolean) => Promise<void>;
+  onSaveChatInstructions: (phone: string, instructions: string) => Promise<void>;
+  onTriggerAiFollowUp: (phone: string, instructions: string) => Promise<void>;
   onTriggerTestIncoming: (phone: string, contactName: string, text: string) => Promise<void>;
   onNavigateSetup: () => void;
 }
@@ -110,6 +116,8 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
   focusedPhone,
   onSendManualReply,
   onToggleAiPause,
+  onSaveChatInstructions,
+  onTriggerAiFollowUp,
   onTriggerTestIncoming,
   onNavigateSetup,
 }) => {
@@ -130,6 +138,14 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
     name?: string;
   } | null>(null);
   const [brokenMediaIds, setBrokenMediaIds] = useState<Record<string, boolean>>({});
+  const [instructionsOpen, setInstructionsOpen] = useState(true);
+  const [instructionsDraft, setInstructionsDraft] = useState('');
+  const [savingInstructions, setSavingInstructions] = useState(false);
+  const [sendingFollowUp, setSendingFollowUp] = useState(false);
+  const [instructionsFeedback, setInstructionsFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   const activeConv =
@@ -146,6 +162,12 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
       setSelectedPhone(conversations[0].phone);
     }
   }, [conversations, selectedPhone]);
+
+  // Sync per-chat instructions textarea when switching conversations or when saved on server
+  useEffect(() => {
+    setInstructionsDraft(activeConv?.customInstructions || '');
+    setInstructionsFeedback(null);
+  }, [activeConv?.phone, activeConv?.customInstructions]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -171,6 +193,70 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
       setReplyDraft('');
     } finally {
       setSendingReply(false);
+    }
+  };
+
+  const handleSaveInstructions = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!activeConv || savingInstructions) return;
+    setSavingInstructions(true);
+    setInstructionsFeedback(null);
+    try {
+      await onSaveChatInstructions(activeConv.phone, instructionsDraft);
+      setInstructionsFeedback({
+        type: 'success',
+        text: instructionsDraft.trim()
+          ? 'Saved — Gemini will follow these instructions for this student.'
+          : 'Cleared custom instructions for this chat.',
+      });
+    } catch (err) {
+      setInstructionsFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to save instructions.',
+      });
+    } finally {
+      setSavingInstructions(false);
+    }
+  };
+
+  const handleClearInstructions = async () => {
+    if (!activeConv || savingInstructions) return;
+    setSavingInstructions(true);
+    setInstructionsFeedback(null);
+    try {
+      setInstructionsDraft('');
+      await onSaveChatInstructions(activeConv.phone, '');
+      setInstructionsFeedback({
+        type: 'success',
+        text: 'Cleared custom instructions for this chat.',
+      });
+    } catch (err) {
+      setInstructionsFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to clear instructions.',
+      });
+    } finally {
+      setSavingInstructions(false);
+    }
+  };
+
+  const handleSendAiFollowUp = async () => {
+    if (!activeConv || sendingFollowUp || !instructionsDraft.trim()) return;
+    setSendingFollowUp(true);
+    setInstructionsFeedback(null);
+    try {
+      await onTriggerAiFollowUp(activeConv.phone, instructionsDraft);
+      setInstructionsFeedback({
+        type: 'success',
+        text: 'AI follow-up generated and sent to this student.',
+      });
+    } catch (err) {
+      setInstructionsFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to send AI follow-up.',
+      });
+    } finally {
+      setSendingFollowUp(false);
     }
   };
 
@@ -394,13 +480,24 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
                     <span className="font-mono text-[11px] text-slate-500 tabular-nums">
                       +{conv.phone}
                     </span>
-                    <span
-                      className={`text-[11px] font-medium ${
-                        conv.aiPaused ? 'text-amber-700' : 'text-emerald-700'
-                      }`}
-                    >
-                      {conv.aiPaused ? 'Human Takeover' : 'AI Auto-Reply'}
-                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {conv.customInstructions?.trim() && (
+                        <span
+                          title="Custom Gemini instructions active for this chat"
+                          className="inline-flex items-center gap-0.5 text-[10px] font-medium text-[#075E54]"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          <span>Note</span>
+                        </span>
+                      )}
+                      <span
+                        className={`text-[11px] font-medium ${
+                          conv.aiPaused ? 'text-amber-700' : 'text-emerald-700'
+                        }`}
+                      >
+                        {conv.aiPaused ? 'Human Takeover' : 'AI Auto-Reply'}
+                      </span>
+                    </div>
                   </div>
                   {lastMsg && (
                     <div className="flex items-center gap-1.5 mt-1.5 min-w-0">
@@ -482,6 +579,105 @@ export const LiveInboxView: React.FC<LiveInboxViewProps> = ({
                     </>
                   )}
                 </button>
+              </div>
+
+              {/* Per-Chat Gemini Instructions Container */}
+              <div className="bg-slate-50 border-b border-slate-200 px-5 py-2.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setInstructionsOpen((prev) => !prev)}
+                  className="w-full flex items-center justify-between gap-3 text-left"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Sparkles className="w-3.5 h-3.5 text-[#075E54] shrink-0" />
+                    <span className="text-xs font-semibold text-slate-800 whitespace-nowrap">
+                      Gemini Instructions for {activeConv.contactName}
+                    </span>
+                    {activeConv.customInstructions?.trim() ? (
+                      <span className="text-[11px] font-medium text-emerald-700 truncate">
+                        · Active{!instructionsOpen ? `: ${activeConv.customInstructions}` : ''}
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-500 truncate">
+                        · Optional student-specific follow-up or guidance
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-slate-500 shrink-0">
+                    {instructionsOpen ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </span>
+                </button>
+
+                {instructionsOpen && (
+                  <form onSubmit={handleSaveInstructions} className="mt-2.5 space-y-2">
+                    <textarea
+                      rows={2}
+                      value={instructionsDraft}
+                      onChange={(e) => {
+                        setInstructionsDraft(e.target.value);
+                        setInstructionsFeedback(null);
+                      }}
+                      placeholder={`Give Gemini instructions specific to ${activeConv.contactName} (e.g., "Follow up about whether they reviewed the quote", "Ask for their Physics rubric before confirming", "Be brief—student only needs exam prep on Friday")...`}
+                      className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-700/20 focus:border-emerald-700 resize-y"
+                    />
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="submit"
+                          disabled={
+                            savingInstructions ||
+                            instructionsDraft.trim() === (activeConv.customInstructions || '').trim()
+                          }
+                          className="px-3 py-1.5 text-[11px] font-medium text-white bg-[#075E54] hover:bg-[#064E46] rounded-md transition-colors flex items-center gap-1.5 disabled:opacity-45"
+                        >
+                          <Save className="w-3 h-3" />
+                          <span>{savingInstructions ? 'Saving...' : 'Save Instructions'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={sendingFollowUp || savingInstructions || !instructionsDraft.trim()}
+                          onClick={() => void handleSendAiFollowUp()}
+                          className="px-3 py-1.5 text-[11px] font-medium text-[#075E54] bg-white border border-emerald-300 hover:bg-emerald-50 rounded-md transition-colors flex items-center gap-1.5 disabled:opacity-45"
+                        >
+                          <Send className="w-3 h-3" />
+                          <span>
+                            {sendingFollowUp ? 'Sending Follow-up...' : 'Send AI Follow-up Now'}
+                          </span>
+                        </button>
+                        {(activeConv.customInstructions || instructionsDraft) && (
+                          <button
+                            type="button"
+                            disabled={savingInstructions || sendingFollowUp}
+                            onClick={() => void handleClearInstructions()}
+                            className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 rounded-md transition-colors disabled:opacity-45"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                      {activeConv.customInstructionsUpdatedAt && (
+                        <span className="text-[10px] text-slate-500 tabular-nums">
+                          Updated {activeConv.customInstructionsUpdatedAt}
+                        </span>
+                      )}
+                    </div>
+                    {instructionsFeedback && (
+                      <p
+                        className={`text-[11px] font-medium ${
+                          instructionsFeedback.type === 'success'
+                            ? 'text-emerald-700'
+                            : 'text-red-700'
+                        }`}
+                      >
+                        {instructionsFeedback.text}
+                      </p>
+                    )}
+                  </form>
+                )}
               </div>
 
               {/* Messages */}

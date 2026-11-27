@@ -92,6 +92,7 @@ export interface LiveConversationMessage {
   mediaUrl?: string;
   mediaMimeType?: string;
   mediaKind?: 'image' | 'video' | 'audio' | 'document' | 'sticker';
+  mediaDownloadFailed?: boolean;
   handoffTriggered?: boolean;
 }
 
@@ -101,6 +102,8 @@ export interface LiveConversation {
   lastActiveAt: string;
   aiPaused: boolean;
   handoffReason: string | null;
+  customInstructions?: string;
+  customInstructionsUpdatedAt?: string;
   leadProfile: LeadProfile;
   messages: LiveConversationMessage[];
 }
@@ -183,5 +186,7 @@ export interface ChatApiResponse {
   handoffRequired: boolean;
   handoffReason: string | null;
   leadProfile: LeadProfile;
+  mediaRelevance?: 'relevant' | 'irrelevant_or_spam' | 'unreadable' | 'none';
+  mediaSummary?: string | null;
   modelUsed?: string;
 }
