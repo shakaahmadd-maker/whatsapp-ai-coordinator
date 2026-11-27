@@ -13,6 +13,7 @@ import {
   findBestMatchingFaq,
 } from './src/utils/promptBuilder.ts';
 import type {
+  AdminNotificationSettings,
   ChatApiRequest,
   ChatApiResponse,
   EscalationTicket,
@@ -41,6 +42,7 @@ const ALLOWED_GRAPH_VERSIONS = [
 const DEFAULT_GRAPH_API_VERSION = 'v25.0';
 const BUSINESS_SELF_PHONE = '19178094906';
 const DEFAULT_EXTERNAL_TEST_PHONE = '923229524271';
+const DEFAULT_ADMIN_ALERT_PHONE = '923229524271';
 const DATA_DIR = process.env.DATA_DIR?.trim()
   ? path.resolve(process.env.DATA_DIR.trim())
   : path.resolve(__dirname, 'data');
@@ -93,6 +95,7 @@ interface ServerStore {
   conversations: Record<string, LiveConversation>;
   tickets: EscalationTicket[];
   webhookLogs: WebhookTrafficEntry[];
+  adminNotification: AdminNotificationSettings;
 }
 
 function sanitizeFaqItems(raw: unknown): KnowledgeBaseFaqItem[] {
@@ -138,6 +141,24 @@ function loadStore(): ServerStore {
           ? sanitizeFaqItems(parsed.config.faqItems)
           : DEFAULT_KB_CONFIG.faqItems,
       };
+      const envAlertPhone = cleanEnvValue(process.env.ADMIN_ALERT_PHONE).replace(/\D/g, '');
+      const defaultAdminNotification: AdminNotificationSettings = {
+        enabled: true,
+        phone: envAlertPhone || DEFAULT_ADMIN_ALERT_PHONE,
+        lastAttempt: null,
+      };
+      const loadedAdmin = parsed.adminNotification;
+      const adminNotification: AdminNotificationSettings = loadedAdmin
+        ? {
+            enabled: typeof loadedAdmin.enabled === 'boolean' ? loadedAdmin.enabled : true,
+            phone:
+              typeof loadedAdmin.phone === 'string' && loadedAdmin.phone.replace(/\D/g, '')
+                ? loadedAdmin.phone.replace(/\D/g, '')
+                : envAlertPhone || DEFAULT_ADMIN_ALERT_PHONE,
+            lastAttempt: loadedAdmin.lastAttempt ?? null,
+          }
+        : defaultAdminNotification;
+
       return {
         config: mergedConfig,
         phoneNumberIdOverride:
@@ -153,11 +174,13 @@ function loadStore(): ServerStore {
         conversations: parsed.conversations || {},
         tickets: Array.isArray(parsed.tickets) ? parsed.tickets : [],
         webhookLogs: Array.isArray(parsed.webhookLogs) ? parsed.webhookLogs.slice(0, 20) : [],
+        adminNotification,
       };
     }
   } catch (err) {
     console.error('[Store load error]', err);
   }
+  const envAlertPhone = cleanEnvValue(process.env.ADMIN_ALERT_PHONE).replace(/\D/g, '');
   return {
     config: DEFAULT_KB_CONFIG,
     phoneNumberIdOverride: undefined,
@@ -166,6 +189,11 @@ function loadStore(): ServerStore {
     conversations: {},
     tickets: [],
     webhookLogs: [],
+    adminNotification: {
+      enabled: true,
+      phone: envAlertPhone || DEFAULT_ADMIN_ALERT_PHONE,
+      lastAttempt: null,
+    },
   };
 }
 
@@ -975,6 +1003,97 @@ async function sendWhatsAppTextMessage(
   }
 }
 
+function buildAdminAlertText(params: {
+  fromPhone: string;
+  contactName: string;
+  text: string;
+  mediaKind?: string;
+  attachmentName?: string;
+}): string {
+  const cleanPhone = params.fromPhone.replace(/\D/g, '') || params.fromPhone;
+  const hasRealName =
+    Boolean(params.contactName?.trim()) &&
+    params.contactName.replace(/\D/g, '') !== cleanPhone;
+  const senderLabel = hasRealName
+    ? `${params.contactName.trim()} (+${cleanPhone})`
+    : `+${cleanPhone}`;
+
+  let preview = params.text.trim();
+  if (!preview) {
+    if (params.mediaKind) {
+      preview = params.attachmentName
+        ? `[${params.mediaKind}: ${params.attachmentName}]`
+        : `[${params.mediaKind}]`;
+    } else if (params.attachmentName) {
+      preview = `[File: ${params.attachmentName}]`;
+    } else {
+      preview = '[New message]';
+    }
+  }
+  if (preview.length > 220) {
+    preview = `${preview.slice(0, 217)}...`;
+  }
+
+  return `New text arrived from ${senderLabel}:\n"${preview}"`;
+}
+
+async function notifyAdminOfNewMessage(params: {
+  fromPhone: string;
+  contactName: string;
+  text: string;
+  mediaKind?: string;
+  attachmentName?: string;
+  forceEvenIfSameNumber?: boolean;
+}): Promise<NonNullable<AdminNotificationSettings['lastAttempt']>> {
+  const settings = store.adminNotification;
+  const targetPhone = settings.phone.replace(/\D/g, '');
+  const senderPhone = params.fromPhone.replace(/\D/g, '') || params.fromPhone;
+  const senderName = params.contactName?.trim() || senderPhone;
+  const at = formatTimestamp();
+
+  if (!targetPhone) {
+    const result: NonNullable<AdminNotificationSettings['lastAttempt']> = {
+      at,
+      status: 'failed',
+      recipientPhone: '',
+      fromPhone: senderPhone,
+      fromName: senderName,
+      error: 'Admin alert phone number is not configured.',
+    };
+    store.adminNotification.lastAttempt = result;
+    persistStore();
+    return result;
+  }
+
+  // Prevent alert loop when the admin alert number itself texts the business bot
+  if (!params.forceEvenIfSameNumber && senderPhone === targetPhone) {
+    const result: NonNullable<AdminNotificationSettings['lastAttempt']> = {
+      at,
+      status: 'skipped_same_number',
+      recipientPhone: targetPhone,
+      fromPhone: senderPhone,
+      fromName: senderName,
+    };
+    store.adminNotification.lastAttempt = result;
+    persistStore();
+    return result;
+  }
+
+  const alertBody = buildAdminAlertText(params);
+  const delivery = await sendWhatsAppTextMessage(targetPhone, alertBody);
+  const result: NonNullable<AdminNotificationSettings['lastAttempt']> = {
+    at,
+    status: delivery.status,
+    recipientPhone: targetPhone,
+    fromPhone: senderPhone,
+    fromName: senderName,
+    ...(delivery.error ? { error: delivery.error } : {}),
+  };
+  store.adminNotification.lastAttempt = result;
+  persistStore();
+  return result;
+}
+
 async function markWhatsAppMessageRead(messageId: string): Promise<boolean> {
   const token = cleanEnvValue(process.env.WHATSAPP_ACCESS_TOKEN);
   const phoneIdCheck = getEffectivePhoneNumberId();
@@ -1135,6 +1254,21 @@ async function processIncomingWhatsAppMessage(params: IncomingWhatsAppParams): P
   store.conversations[fromPhone] = existing;
   persistStore();
   broadcastSnapshot();
+
+  // Send WhatsApp alert to admin number (e.g. +923229524271) whenever a new message arrives
+  if (store.adminNotification?.enabled) {
+    try {
+      await notifyAdminOfNewMessage({
+        fromPhone,
+        contactName: existing.contactName,
+        text,
+        mediaKind,
+        attachmentName: attachment?.name,
+      });
+    } catch (err) {
+      console.warn('[Admin WhatsApp alert error]', err);
+    }
+  }
 
   const markedRead = await markWhatsAppMessageRead(messageId);
   if (markedRead) {
@@ -1486,6 +1620,7 @@ function buildWhatsAppStatus(): WhatsAppConnectionStatus {
     graphApiVersion: getEffectiveGraphApiVersion(),
     lastVerification: effectiveVerification,
     recentWebhookEvents: store.webhookLogs || [],
+    adminNotification: store.adminNotification,
   };
 }
 
@@ -1545,6 +1680,46 @@ app.post('/api/whatsapp/verify-connection', async (_req, res) => {
   store.lastVerification = await verifyLiveMetaConnection();
   persistStore();
   res.json(buildWhatsAppStatus());
+});
+
+// Configure WhatsApp alert notifications sent to coordinator phone when a new message arrives
+app.put('/api/whatsapp/admin-notification', (req, res) => {
+  const { enabled, phone } = req.body as { enabled?: boolean; phone?: string };
+
+  if (typeof enabled === 'boolean') {
+    store.adminNotification.enabled = enabled;
+  }
+
+  if (typeof phone === 'string') {
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length < 8 || digits.length > 18) {
+      res.status(400).json({
+        error: 'Enter a valid WhatsApp phone number with country code (e.g. 923229524271).',
+      });
+      return;
+    }
+    if (isBusinessSelfNumber(digits)) {
+      res.status(400).json({
+        error: 'Alert phone cannot be your own business WhatsApp number.',
+      });
+      return;
+    }
+    store.adminNotification.phone = digits;
+  }
+
+  persistStore();
+  res.json(buildWhatsAppStatus());
+});
+
+// Send a manual test WhatsApp alert to the configured coordinator number
+app.post('/api/whatsapp/admin-notification/test', async (_req, res) => {
+  const result = await notifyAdminOfNewMessage({
+    fromPhone: '447700900123',
+    contactName: 'Sample Student',
+    text: 'Test alert: a new WhatsApp message arrived in your studio.',
+    forceEvenIfSameNumber: true,
+  });
+  res.json({ result, status: buildWhatsAppStatus() });
 });
 
 // Live conversations & escalation tickets

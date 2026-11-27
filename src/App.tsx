@@ -343,6 +343,33 @@ export default function App() {
     }
   };
 
+  const handleSaveAdminNotification = async (enabled: boolean, phone: string) => {
+    const res = await fetch('/api/whatsapp/admin-notification', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, phone }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.error || 'Failed to save WhatsApp alert settings.');
+    }
+    setWaStatus(payload as WhatsAppConnectionStatus);
+  };
+
+  const handleTestAdminNotification = async () => {
+    const res = await fetch('/api/whatsapp/admin-notification/test', {
+      method: 'POST',
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload?.error || 'Failed to send test WhatsApp alert.');
+    }
+    if (payload?.status) {
+      setWaStatus(payload.status as WhatsAppConnectionStatus);
+    }
+    return payload?.result;
+  };
+
   const handleTriggerTestIncoming = async (
     phone: string,
     contactName: string,
@@ -658,6 +685,8 @@ export default function App() {
             onRefreshStatus={refreshStatus}
             onSavePhoneNumberId={handleSavePhoneNumberId}
             onVerifyConnection={handleVerifyConnection}
+            onSaveAdminNotification={handleSaveAdminNotification}
+            onTestAdminNotification={handleTestAdminNotification}
             onTriggerTestIncoming={handleTriggerTestIncoming}
             onNavigateInbox={() => setActiveTab('inbox')}
           />

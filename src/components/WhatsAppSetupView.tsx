@@ -1,6 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { Check, CheckCircle2, Copy, AlertTriangle, Send, RefreshCw } from 'lucide-react';
-import type { KnowledgeBaseConfig, WhatsAppConnectionStatus } from '../types/agent';
+import { BellRing, Check, CheckCircle2, Copy, AlertTriangle, Send, RefreshCw } from 'lucide-react';
+import type {
+  AdminNotificationSettings,
+  KnowledgeBaseConfig,
+  WhatsAppConnectionStatus,
+} from '../types/agent';
 import { buildSystemPrompt } from '../utils/promptBuilder';
 
 interface WhatsAppSetupViewProps {
@@ -9,6 +13,8 @@ interface WhatsAppSetupViewProps {
   onRefreshStatus: () => Promise<void>;
   onSavePhoneNumberId: (phoneNumberId: string, graphApiVersion?: string) => Promise<void>;
   onVerifyConnection: () => Promise<void>;
+  onSaveAdminNotification: (enabled: boolean, phone: string) => Promise<void>;
+  onTestAdminNotification: () => Promise<AdminNotificationSettings['lastAttempt']>;
   onTriggerTestIncoming: (phone: string, contactName: string, text: string) => Promise<void>;
   onNavigateInbox: () => void;
 }
@@ -21,6 +27,8 @@ export const WhatsAppSetupView: React.FC<WhatsAppSetupViewProps> = ({
   onRefreshStatus,
   onSavePhoneNumberId,
   onVerifyConnection,
+  onSaveAdminNotification,
+  onTestAdminNotification,
   onTriggerTestIncoming,
   onNavigateInbox,
 }) => {
@@ -34,7 +42,19 @@ export const WhatsAppSetupView: React.FC<WhatsAppSetupViewProps> = ({
     type: 'success' | 'error';
     text: string;
   } | null>(null);
-  const [testPhone, setTestPhone] = useState('923229524271');
+  const [alertEnabled, setAlertEnabled] = useState(
+    status?.adminNotification?.enabled ?? true
+  );
+  const [alertPhone, setAlertPhone] = useState(
+    status?.adminNotification?.phone || '923229524271'
+  );
+  const [savingAlert, setSavingAlert] = useState(false);
+  const [testingAlert, setTestingAlert] = useState(false);
+  const [alertFeedback, setAlertFeedback] = useState<{
+    type: 'success' | 'error' | 'info';
+    text: string;
+  } | null>(null);
+  const [testPhone, setTestPhone] = useState('447700900123');
   const [testName, setTestName] = useState('Zainab Khan');
   const [testMessage, setTestMessage] = useState(
     'Assalam o alaikum, mujhe Master level Data Science coursework guidance chahiye. Next week deadline hai.'
@@ -50,6 +70,15 @@ export const WhatsAppSetupView: React.FC<WhatsAppSetupViewProps> = ({
       setGraphVersion(status.graphApiVersion);
     }
   }, [status?.activePhoneNumberId, status?.graphApiVersion, phoneIdInput]);
+
+  useEffect(() => {
+    if (status?.adminNotification) {
+      setAlertEnabled(status.adminNotification.enabled);
+      if (status.adminNotification.phone) {
+        setAlertPhone(status.adminNotification.phone);
+      }
+    }
+  }, [status?.adminNotification?.enabled, status?.adminNotification?.phone]);
 
   const webhookUrl =
     typeof window !== 'undefined'
@@ -103,6 +132,62 @@ export const WhatsAppSetupView: React.FC<WhatsAppSetupViewProps> = ({
       await onVerifyConnection();
     } finally {
       setVerifying(false);
+    }
+  };
+
+  const handleSaveAlertSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (savingAlert) return;
+    setSavingAlert(true);
+    setAlertFeedback(null);
+    try {
+      await onSaveAdminNotification(alertEnabled, alertPhone);
+      setAlertFeedback({
+        type: 'success',
+        text: alertEnabled
+          ? `WhatsApp alerts active — new texts will notify +${alertPhone.replace(/\D/g, '')}.`
+          : 'WhatsApp alert forwarding paused.',
+      });
+    } catch (err) {
+      setAlertFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Unable to save alert settings.',
+      });
+    } finally {
+      setSavingAlert(false);
+    }
+  };
+
+  const handleSendTestAlert = async () => {
+    if (testingAlert) return;
+    setTestingAlert(true);
+    setAlertFeedback(null);
+    try {
+      await onSaveAdminNotification(alertEnabled, alertPhone);
+      const result = await onTestAdminNotification();
+      if (result?.status === 'sent') {
+        setAlertFeedback({
+          type: 'success',
+          text: `Test WhatsApp alert sent to +${result.recipientPhone}.`,
+        });
+      } else if (result?.status === 'simulated') {
+        setAlertFeedback({
+          type: 'info',
+          text: `Alert simulated for +${result.recipientPhone} (configure Meta token to send live).`,
+        });
+      } else {
+        setAlertFeedback({
+          type: 'error',
+          text: result?.error || `Alert failed (${result?.status || 'unknown'}).`,
+        });
+      }
+    } catch (err) {
+      setAlertFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to send test alert.',
+      });
+    } finally {
+      setTestingAlert(false);
     }
   };
 
@@ -507,6 +592,124 @@ export const WhatsAppSetupView: React.FC<WhatsAppSetupViewProps> = ({
             </div>
           )}
         </div>
+      </div>
+
+      {/* Section 1.25: Admin WhatsApp Notification Forwarding */}
+      <div className="bg-white border border-slate-200 rounded-xl p-6">
+        <div className="flex flex-wrap items-start justify-between gap-4 pb-4 border-b border-slate-200">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center shrink-0">
+              <BellRing className="w-4 h-4 text-[#075E54]" />
+            </div>
+            <div>
+              <h2 className="text-sm font-display font-semibold text-slate-900">
+                WhatsApp Alert on New Incoming Texts
+              </h2>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Automatically sends a WhatsApp notification (sender name, number, and message preview) to your coordinator phone whenever a student texts in.
+              </p>
+            </div>
+          </div>
+
+          <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs font-medium text-slate-800">
+            <input
+              type="checkbox"
+              checked={alertEnabled}
+              onChange={(e) => {
+                setAlertEnabled(e.target.checked);
+                setAlertFeedback(null);
+              }}
+              className="w-4 h-4 accent-[#075E54] rounded"
+            />
+            <span>{alertEnabled ? 'Alerts Enabled' : 'Alerts Paused'}</span>
+          </label>
+        </div>
+
+        <form onSubmit={handleSaveAlertSettings} className="mt-4 space-y-3">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-end gap-3">
+            <div className="flex-1">
+              <label
+                htmlFor="admin-alert-phone"
+                className="block text-xs font-medium text-slate-700 mb-1"
+              >
+                Notification Recipient WhatsApp Number (country code + digits)
+              </label>
+              <input
+                id="admin-alert-phone"
+                type="text"
+                inputMode="tel"
+                value={alertPhone}
+                onChange={(e) => {
+                  setAlertPhone(e.target.value);
+                  setAlertFeedback(null);
+                }}
+                placeholder="923229524271"
+                className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-700/20 focus:border-emerald-700"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="submit"
+                disabled={savingAlert}
+                className="px-4 py-2 text-xs font-medium text-white bg-[#075E54] hover:bg-[#064E46] rounded-lg transition-colors whitespace-nowrap disabled:opacity-50"
+              >
+                {savingAlert ? 'Saving...' : 'Save Alert Number'}
+              </button>
+              <button
+                type="button"
+                disabled={testingAlert || savingAlert}
+                onClick={() => void handleSendTestAlert()}
+                className="px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap disabled:opacity-50"
+              >
+                {testingAlert ? 'Sending Alert...' : 'Send Test Alert'}
+              </button>
+            </div>
+          </div>
+
+          <p className="text-[11px] text-slate-500">
+            Note: Meta requires an active 24-hour session to send free-form text alerts — send one quick message from <code className="font-mono">+{alertPhone.replace(/\D/g, '') || '923229524271'}</code> to your business WhatsApp number (<code className="font-mono">+1 917-809-4906</code>) if Meta reports a 24h window error. Messages sent from the alert number itself are not echoed back to avoid loops.
+          </p>
+
+          {alertFeedback && (
+            <div
+              className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+                alertFeedback.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : alertFeedback.type === 'error'
+                  ? 'bg-red-50 border-red-200 text-red-900'
+                  : 'bg-slate-50 border-slate-200 text-slate-800'
+              }`}
+            >
+              {alertFeedback.text}
+            </div>
+          )}
+
+          {status?.adminNotification?.lastAttempt && (
+            <div className="rounded-lg bg-slate-50 border border-slate-200 px-3.5 py-2.5 text-xs text-slate-700 flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <span className="font-semibold text-slate-900">Last Alert: </span>
+                <span>
+                  {status.adminNotification.lastAttempt.status === 'sent'
+                    ? `Sent to +${status.adminNotification.lastAttempt.recipientPhone}`
+                    : status.adminNotification.lastAttempt.status === 'simulated'
+                    ? `Simulated for +${status.adminNotification.lastAttempt.recipientPhone}`
+                    : status.adminNotification.lastAttempt.status === 'skipped_same_number'
+                    ? `Skipped (sender is the alert number +${status.adminNotification.lastAttempt.recipientPhone})`
+                    : `Failed: ${status.adminNotification.lastAttempt.error || 'Unknown error'}`}
+                </span>
+                <span className="text-slate-500">
+                  {' '}
+                  · triggered by {status.adminNotification.lastAttempt.fromName} (+
+                  {status.adminNotification.lastAttempt.fromPhone})
+                </span>
+              </div>
+              <span className="text-[11px] text-slate-500 tabular-nums shrink-0">
+                {status.adminNotification.lastAttempt.at}
+              </span>
+            </div>
+          )}
+        </form>
       </div>
 
       {/* Section 1.5: Recent Incoming Meta Webhook Traffic */}

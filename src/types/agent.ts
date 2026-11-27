@@ -130,6 +130,19 @@ export interface WebhookTrafficEntry {
   detail: string;
 }
 
+export interface AdminNotificationSettings {
+  enabled: boolean;
+  phone: string;
+  lastAttempt?: {
+    at: string;
+    status: 'sent' | 'simulated' | 'failed' | 'skipped_same_number' | 'skipped_self';
+    recipientPhone: string;
+    fromPhone: string;
+    fromName: string;
+    error?: string;
+  } | null;
+}
+
 export interface WhatsAppConnectionStatus {
   configured: boolean;
   hasGeminiKey: boolean;
@@ -148,6 +161,7 @@ export interface WhatsAppConnectionStatus {
   graphApiVersion: string;
   lastVerification: WhatsAppVerifyResult | null;
   recentWebhookEvents?: WebhookTrafficEntry[];
+  adminNotification?: AdminNotificationSettings;
 }
 
 export interface ChatApiRequest {
